@@ -1,0 +1,62 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# IDE / editor
+.idea/
+.vscode/
+
+# Local private archive
+private_archive/
+
+# Local env / config
+.env
+.env.*
+deploy/*.local.yml
+config/*.conf
+!config/*.example.conf
+
+# Logs
+log/
+backtest/log/
+*.log
+
+# Generated backtest outputs
+backtest/runs/output/
+backtest/runs/cache/
+
+# Generated research artifacts
+research/**/cache*/
+research/**/output_*/
+*.parquet
+*.png
+
+# Demo data packages
+examples/demo_mongo/data/
+examples/demo_mongo/*.zip
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# OS files
+Thumbs.db
+Desktop.ini
+
+# Local temporary artifacts
+*.tmp
+*.bak

@@ -1,0 +1,80 @@
+"""兼容导出层。"""
+
+from backtest.analytics import BacktestAnalyzer, BacktestAnalyticsReport
+from backtest.data import MongoDataPortal
+from backtest.execution import (
+    BaseExecutionModel,
+    BaseMinuteExecutor,
+    DailyBarExecutor,
+    EngineConfig,
+    SignalDrivenBacktestEngine,
+    WindowFirstBarExecutor,
+)
+from backtest.portfolio import (
+    BacktestResult,
+    BasePositionSizer,
+    EquityPoint,
+    FixedFractionSizer,
+    PortfolioLedger,
+    StockOrder,
+    StockPosition,
+    TradeRecord,
+)
+from backtest.risk import (
+    AtrExitPolicy,
+    BaseExitPolicy,
+    BreakEvenExitPolicy,
+    CloseBelowMaExitPolicy,
+    CompositeExitPolicy,
+    ExitDataRequirement,
+    ExitDecision,
+    EXIT_STAGE_CLOSE_CONFIRMED,
+    EXIT_STAGE_INTRADAY,
+    FixedPriceExitPolicy,
+    FixedStopLossExitPolicy,
+    TimeExitPolicy,
+)
+from backtest.strategies import (
+    BaseSelectionStrategy,
+    DailyCandidate,
+    MinerviniAshareStrategy,
+    SmallCapAmountShockReversalStrategy,
+    SmallCapLiquidityRotationStrategy,
+)
+
+__all__ = [
+    "AtrExitPolicy",
+    "BacktestAnalyzer",
+    "BacktestAnalyticsReport",
+    "BacktestResult",
+    "BaseExecutionModel",
+    "BaseExitPolicy",
+    "BaseMinuteExecutor",
+    "BasePositionSizer",
+    "BaseSelectionStrategy",
+    "BreakEvenExitPolicy",
+    "CloseBelowMaExitPolicy",
+    "CompositeExitPolicy",
+    "DailyBarExecutor",
+    "DailyCandidate",
+    "EngineConfig",
+    "EquityPoint",
+    "ExitDataRequirement",
+    "ExitDecision",
+    "EXIT_STAGE_CLOSE_CONFIRMED",
+    "EXIT_STAGE_INTRADAY",
+    "FixedPriceExitPolicy",
+    "FixedFractionSizer",
+    "FixedStopLossExitPolicy",
+    "MongoDataPortal",
+    "PortfolioLedger",
+    "SignalDrivenBacktestEngine",
+    "MinerviniAshareStrategy",
+    "SmallCapAmountShockReversalStrategy",
+    "SmallCapLiquidityRotationStrategy",
+    "StockOrder",
+    "StockPosition",
+    "TimeExitPolicy",
+    "TradeRecord",
+    "WindowFirstBarExecutor",
+]

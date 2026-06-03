@@ -1,0 +1,27 @@
+# Core framework
+PyYAML>=6.0
+pandas>=2.0
+numpy>=1.24
+pymongo>=4.6
+SQLAlchemy>=2.0
+psycopg2-binary>=2.9
+aioredis>=2.0
+alembic>=1.13
+
+# Analysis / reporting
+matplotlib>=3.7
+seaborn>=0.13
+plotly>=5.20
+scipy>=1.10
+loguru>=0.7
+streamlit>=1.30
+
+# Data acquisition / utilities
+requests>=2.31
+baostock>=0.8.8
+akshare>=1.12
+APScheduler>=3.10
+xtquant
+
+# Optional local-only dependencies
+# TA-Lib
