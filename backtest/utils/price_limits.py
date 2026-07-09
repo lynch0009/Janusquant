@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 
@@ -65,6 +66,68 @@ def calculate_a_share_limit_prices(
     return up_limit, down_limit
 
 
+def calculate_a_share_limit_prices_series(
+    codes: pd.Series,
+    preclose: pd.Series,
+    *,
+    is_st: pd.Series | None = None,
+) -> tuple[pd.Series, pd.Series]:
+    """Vectorized A-share daily price limits using the scalar rule exactly."""
+
+    index = codes.index
+    numeric_codes = codes.astype(str).str.strip().str.split(".", n=1).str[-1]
+    preclose_values = pd.to_numeric(preclose, errors="coerce")
+    if is_st is None:
+        st_values = pd.Series(False, index=index, dtype=bool)
+    else:
+        raw_st = is_st.reindex(index)
+        if raw_st.dtype == bool:
+            st_values = raw_st.fillna(False)
+        else:
+            st_values = raw_st.astype(str).str.strip().str.lower().isin(
+                {"true", "1", "yes", "y"}
+            )
+    ratios = pd.Series(0.10, index=index, dtype="float64")
+    ratios.loc[numeric_codes.str.startswith(("30", "68"), na=False)] = 0.20
+    ratios.loc[numeric_codes.str.startswith(("4", "8"), na=False)] = 0.30
+    ratios.loc[st_values] = 0.05
+
+    valid = preclose_values.notna() & (preclose_values > 0)
+    up_values = np.floor(preclose_values * (1.0 + ratios) * 100.0 + 0.5) / 100.0
+    down_values = np.floor(preclose_values * (1.0 - ratios) * 100.0 + 0.5) / 100.0
+    return up_values.where(valid), down_values.where(valid)
+
+
+def is_limit_down_close_series(
+    codes: pd.Series,
+    preclose: pd.Series,
+    close: pd.Series,
+    *,
+    is_st: pd.Series | None = None,
+    atol: float = 1e-6,
+) -> pd.Series:
+    """Vectorized close-at-limit-down predicate."""
+
+    _, down_limit = calculate_a_share_limit_prices_series(codes, preclose, is_st=is_st)
+    close_values = pd.to_numeric(close, errors="coerce")
+    return down_limit.notna() & close_values.notna() & ((close_values - down_limit).abs() <= float(atol))
+
+
+def is_limit_up_close_series(
+    codes: pd.Series,
+    preclose: pd.Series,
+    close: pd.Series,
+    *,
+    is_st: pd.Series | None = None,
+    atol: float = 1e-6,
+) -> pd.Series:
+    """Vectorized close-at-limit-up predicate."""
+
+    up_limit, _ = calculate_a_share_limit_prices_series(codes, preclose, is_st=is_st)
+    close_values = pd.to_numeric(close, errors="coerce")
+    return up_limit.notna() & close_values.notna() & ((close_values - up_limit).abs() <= float(atol))
+
+
 def calculate_limit_up_price(code: Any, preclose: Any, *, is_st: bool = False) -> float | None:
     """计算当日涨停价。"""
 
@@ -122,22 +185,19 @@ def add_limit_up_features(
     result[date_col] = pd.to_datetime(result[date_col])
     result = result.sort_values([code_col, date_col]).reset_index(drop=True)
 
-    result["limit_up_price"] = result.apply(
-        lambda row: calculate_limit_up_price(
-            row[code_col],
-            row.get(preclose_col),
-            is_st=bool(row.get(is_st_col, False)),
-        ),
-        axis=1,
+    preclose_values = result[preclose_col] if preclose_col in result.columns else pd.Series(np.nan, index=result.index)
+    close_values = result[close_col] if close_col in result.columns else pd.Series(np.nan, index=result.index)
+    st_values = result[is_st_col] if is_st_col in result.columns else None
+    result["limit_up_price"], _ = calculate_a_share_limit_prices_series(
+        result[code_col],
+        preclose_values,
+        is_st=st_values,
     )
-    result["is_limit_up"] = result.apply(
-        lambda row: is_limit_up_close(
-            row[code_col],
-            row.get(preclose_col),
-            row.get(close_col),
-            is_st=bool(row.get(is_st_col, False)),
-        ),
-        axis=1,
+    result["is_limit_up"] = is_limit_up_close_series(
+        result[code_col],
+        preclose_values,
+        close_values,
+        is_st=st_values,
     )
     result["limit_up_streak"] = (
         result.groupby(code_col, group_keys=False)["is_limit_up"].apply(consecutive_true_counts).astype(int)
@@ -340,6 +400,7 @@ __all__ = [
     "LIMIT_STATE_UP_TOUCHED",
     "add_limit_up_features",
     "calculate_a_share_limit_prices",
+    "calculate_a_share_limit_prices_series",
     "calculate_limit_up_price",
     "consecutive_true_counts",
     "decide_daily_buy_fill",
@@ -348,5 +409,7 @@ __all__ = [
     "get_a_share_limit_ratio",
     "get_daily_limit_status",
     "is_limit_up_close",
+    "is_limit_up_close_series",
+    "is_limit_down_close_series",
     "strict_round",
 ]

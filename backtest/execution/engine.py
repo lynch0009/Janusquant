@@ -14,7 +14,7 @@ import uuid
 
 import pandas as pd
 
-from backtest.data import MongoDataPortal, ResearchDailyHistoryStore
+from backtest.data import DuckDBDataPortal, ResearchDailyHistoryStore
 from backtest.execution.config import EngineConfig
 from backtest.execution.executors import (
     BaseExecutionModel,
@@ -34,7 +34,7 @@ from backtest.risk import (
     EXIT_STAGE_CLOSE_CONFIRMED,
     EXIT_STAGE_INTRADAY,
 )
-from backtest.strategies import BaseSelectionStrategy, DailyCandidate
+from backtest.strategies import BaseSelectionStrategy, DailyCandidate, IndexSlotRebalanceIntent
 from backtest.utils.datetime_utils import to_pydatetime
 from backtest.utils.frame_utils import first_sorted_row
 from backtest.utils.log import log_event
@@ -63,12 +63,12 @@ class SignalDrivenBacktestEngine(
         calendar_code: str = "sh.000001",
         position_sizer: BasePositionSizer | None = None,
         exit_policy: BaseExitPolicy | None = None,
-        data_portal: MongoDataPortal | None = None,
+        data_portal: DuckDBDataPortal | None = None,
     ):
         self.strategy = strategy
         self.execution_model = execution_model or WindowFirstBarExecutor()
         self.config = config or EngineConfig()
-        self.data_portal = data_portal or MongoDataPortal(db_client, calendar_code=calendar_code)
+        self.data_portal = data_portal or DuckDBDataPortal(db_client, calendar_code=calendar_code)
         self.benchmark_code = self.config.benchmark_code
         self.position_sizer = position_sizer or FixedFractionSizer()
         self.exit_policy = exit_policy
@@ -378,6 +378,8 @@ class SignalDrivenBacktestEngine(
                 continue
 
             frame = execution_frames.get(pending_exit.code)
+            order_metadata = merge_metadata(position.metadata, pending_exit.metadata)
+            virtual_unit = self._index_slot_virtual_unit(order_metadata, position=position)
             exit_order = StockOrder.create(
                 code=pending_exit.code,
                 side="SELL",
@@ -387,7 +389,7 @@ class SignalDrivenBacktestEngine(
                 reason=pending_exit.reason,
                 requested_quantity=position.quantity,
                 score=position.score,
-                metadata=merge_metadata(position.metadata, pending_exit.metadata),
+                metadata=order_metadata,
                 risk_rule_name=pending_exit.risk_rule_name,
             )
 
@@ -409,11 +411,13 @@ class SignalDrivenBacktestEngine(
                 )
                 continue
 
+            frame = self._scale_index_slot_execution_frame(frame, virtual_unit, order_metadata)
+            exit_order.metadata = copy_metadata(order_metadata)
             trade, cash_delta = self.execution_model.execute_exit(
                 position,
                 trade_date,
                 frame,
-                self.config,
+                self._index_slot_virtual_config(virtual_unit),
                 reason=pending_exit.reason,
             )
             if trade is None:
@@ -584,6 +588,370 @@ class SignalDrivenBacktestEngine(
     @staticmethod
     def _candidate_entry_type(candidate: DailyCandidate) -> str:
         return str(candidate.metadata.get("entry_type", "initial") or "initial")
+
+    def _process_index_slot_rebalance_intents(
+        self,
+        ledger: PortfolioLedger,
+        trade_index: int,
+        trade_date: datetime,
+        intents: list[IndexSlotRebalanceIntent],
+    ) -> None:
+        """在普通信号模式下按指数槽位目标做窄口径调仓。"""
+
+        if not intents:
+            return
+
+        execution_frames = self._load_execution_frames(
+            sorted({intent.code for intent in intents}),
+            trade_date,
+            for_exit=False,
+        )
+        for intent in intents:
+            frame = execution_frames.get(intent.code)
+            metadata = copy_metadata(intent.metadata)
+            metadata["index_target_market_value"] = float(intent.target_market_value)
+            target_market_value = max(float(intent.target_market_value), 0.0)
+            position = ledger.positions.get(intent.code)
+            virtual_unit = self._index_slot_virtual_unit(metadata, position=position)
+            metadata["index_virtual_unit"] = virtual_unit
+            current_market_value = float(position.market_value) if position is not None else 0.0
+
+            if position is not None and current_market_value > target_market_value:
+                self._execute_index_slot_rebalance_sell(
+                    ledger,
+                    trade_index,
+                    trade_date,
+                    intent,
+                    frame,
+                    position,
+                    current_market_value=current_market_value,
+                    target_market_value=target_market_value,
+                    metadata=metadata,
+                )
+                position = ledger.positions.get(intent.code)
+                current_market_value = float(position.market_value) if position is not None else 0.0
+
+            buy_budget = target_market_value - current_market_value
+            if intent.reason == "index_slot_release_for_event_entry":
+                continue
+            if buy_budget <= 0:
+                continue
+
+            buy_metadata = merge_metadata(
+                metadata,
+                {
+                    "entry_source": "weekly_index_slot_fill",
+                    "entry_reason": "amount_shock_event_regime_index_slot_fill",
+                    "forced_budget": buy_budget,
+                    "target_exit_trade_date": datetime.max.replace(hour=0, minute=0, second=0, microsecond=0),
+                },
+            )
+            self._execute_index_slot_rebalance_buy(
+                ledger,
+                trade_index,
+                trade_date,
+                intent,
+                frame,
+                buy_budget=buy_budget,
+                metadata=buy_metadata,
+                virtual_unit=virtual_unit,
+            )
+
+    def _execute_index_slot_rebalance_buy(
+        self,
+        ledger: PortfolioLedger,
+        trade_index: int,
+        trade_date: datetime,
+        intent: IndexSlotRebalanceIntent,
+        frame: pd.DataFrame | None,
+        *,
+        buy_budget: float,
+        metadata: dict,
+        virtual_unit: float,
+    ) -> None:
+        existing_position = ledger.positions.get(intent.code)
+        buy_metadata = copy_metadata(metadata)
+        buy_metadata["forced_budget"] = float(buy_budget)
+        buy_metadata["target_exit_trade_date"] = datetime.max.replace(hour=0, minute=0, second=0, microsecond=0)
+        if existing_position is not None:
+            buy_metadata["entry_type"] = "add_on"
+            buy_metadata["add_on_stage"] = "weekly_index_slot_fill"
+
+        budget = max(min(float(buy_budget), ledger.cash), 0.0)
+        entry_order = StockOrder.create(
+            code=intent.code,
+            side="BUY",
+            signal_date=intent.signal_date,
+            scheduled_trade_date=trade_date,
+            execution_model=self.execution_model.data_frequency,
+            reason=str(buy_metadata.get("entry_reason", "amount_shock_event_regime_index_slot_fill")),
+            requested_budget=budget,
+            score=0.0,
+            metadata=buy_metadata,
+        )
+        if frame is None or frame.empty:
+            entry_order.mark_skipped("no_execution_data")
+            ledger.register_order(entry_order)
+            self._log_event(
+                "index_slot_rebalance_entry_skipped",
+                trade_date=trade_date,
+                code=intent.code,
+                skip_reason="no_execution_data",
+            )
+            return
+        if budget <= 0:
+            entry_order.mark_skipped("no_cash")
+            ledger.register_order(entry_order)
+            self._log_event(
+                "index_slot_rebalance_entry_skipped",
+                trade_date=trade_date,
+                code=intent.code,
+                skip_reason="no_cash",
+            )
+            return
+
+        scaled_frame = self._scale_index_slot_execution_frame(frame, virtual_unit, buy_metadata)
+        target_exit_trade_date = buy_metadata["target_exit_trade_date"]
+        candidate = DailyCandidate(
+            signal_date=intent.signal_date,
+            code=intent.code,
+            score=0.0,
+            hold_days=1,
+            metadata=buy_metadata,
+        )
+        position, trade, cash_delta = self.execution_model.execute_entry(
+            candidate,
+            trade_date,
+            scaled_frame,
+            budget,
+            self._index_slot_virtual_config(virtual_unit),
+            target_exit_trade_date,
+        )
+        if position is not None and trade is not None:
+            entry_order.metadata = copy_metadata(buy_metadata)
+            entry_order.mark_filled(trade)
+            ledger.register_order(entry_order)
+            if existing_position is not None:
+                existing_position.last_price = trade.price
+                ledger.add_to_position(
+                    intent.code,
+                    trade,
+                    cash_delta,
+                    entry_order.order_id,
+                    score=0.0,
+                    metadata=copy_metadata(buy_metadata),
+                    target_exit_trade_date=target_exit_trade_date,
+                )
+                self._log_event(
+                    "index_slot_rebalance_add_on_filled",
+                    trade_date=trade_date,
+                    code=intent.code,
+                    price=trade.price,
+                    quantity=trade.quantity,
+                    budget=budget,
+                    cash=ledger.cash,
+                )
+                return
+
+            position.position_id = uuid.uuid4().hex
+            position.open_order_id = entry_order.order_id
+            position.entry_transaction_cost = trade.commission + trade.tax
+            position.entry_trade_index = trade_index
+            self._apply_candidate_risk_to_position(position, candidate)
+            if self.exit_policy is not None:
+                self.exit_policy.initialize_position(position)
+            ledger.open_position(position, trade, cash_delta)
+            self._log_event(
+                "index_slot_rebalance_entry_filled",
+                trade_date=trade_date,
+                code=intent.code,
+                price=trade.price,
+                quantity=trade.quantity,
+                budget=budget,
+                cash=ledger.cash,
+            )
+            return
+
+        entry_order.mark_skipped("no_fill")
+        ledger.register_order(entry_order)
+        self._log_event(
+            "index_slot_rebalance_entry_skipped",
+            trade_date=trade_date,
+            code=intent.code,
+            skip_reason="no_fill",
+            budget=budget,
+        )
+
+    def _execute_index_slot_rebalance_sell(
+        self,
+        ledger: PortfolioLedger,
+        trade_index: int,
+        trade_date: datetime,
+        intent: IndexSlotRebalanceIntent,
+        frame: pd.DataFrame | None,
+        position,
+        *,
+        current_market_value: float,
+        target_market_value: float,
+        metadata: dict,
+    ) -> None:
+        virtual_unit = self._index_slot_virtual_unit(metadata, position=position)
+        lot_size = self._index_slot_virtual_lot_size(virtual_unit)
+        metadata["index_virtual_unit"] = virtual_unit
+        if frame is None or frame.empty:
+            fallback_price = self._index_slot_rebalance_fallback_price(position)
+            if fallback_price is None:
+                return
+            sell_quantity = self._index_slot_rebalance_sell_quantity(
+                position,
+                current_market_value=current_market_value,
+                target_market_value=target_market_value,
+                reference_price=fallback_price,
+                lot_size=lot_size,
+            )
+            if sell_quantity < lot_size:
+                return
+            order = StockOrder.create(
+                code=intent.code,
+                side="SELL",
+                signal_date=position.signal_date,
+                scheduled_trade_date=trade_date,
+                execution_model=self.execution_model.data_frequency,
+                reason=intent.reason,
+                requested_quantity=sell_quantity,
+                score=position.score,
+                metadata=metadata,
+            )
+            order.mark_skipped("no_execution_data")
+            ledger.register_order(order)
+            return
+
+        scaled_frame = self._scale_index_slot_execution_frame(frame, virtual_unit, metadata)
+        reference_price = self._execution_reference_price(scaled_frame)
+        if reference_price is None or reference_price <= 0:
+            return
+
+        sell_quantity = self._index_slot_rebalance_sell_quantity(
+            position,
+            current_market_value=current_market_value,
+            target_market_value=target_market_value,
+            reference_price=reference_price,
+            lot_size=lot_size,
+        )
+        if sell_quantity < lot_size:
+            return
+
+        order = StockOrder.create(
+            code=intent.code,
+            side="SELL",
+            signal_date=position.signal_date,
+            scheduled_trade_date=trade_date,
+            execution_model=self.execution_model.data_frequency,
+            reason=intent.reason,
+            requested_quantity=sell_quantity,
+            score=position.score,
+            metadata=metadata,
+        )
+        reduce_position = replace(position, quantity=sell_quantity)
+        trade, cash_delta = self.execution_model.execute_exit(
+            reduce_position,
+            trade_date,
+            scaled_frame,
+            self._index_slot_virtual_config(virtual_unit),
+            reason=intent.reason,
+        )
+        if trade is None:
+            order.mark_skipped("no_fill")
+            ledger.register_order(order)
+            return
+
+        order.mark_filled(trade)
+        ledger.register_order(order)
+        ledger.reduce_position(
+            intent.code,
+            trade,
+            cash_delta,
+            order.order_id,
+            reduce_quantity=sell_quantity,
+            exit_trade_index=trade_index,
+            exit_reason=intent.reason,
+        )
+
+    def _index_slot_rebalance_sell_quantity(
+        self,
+        position,
+        *,
+        current_market_value: float,
+        target_market_value: float,
+        reference_price: float,
+        lot_size: int | None = None,
+    ) -> int:
+        if reference_price <= 0:
+            return 0
+        resolved_lot_size = max(int(lot_size or self.config.lot_size), 1)
+        position_quantity = int(position.quantity)
+        if target_market_value <= 0:
+            return position_quantity
+        sell_value = max(current_market_value - target_market_value, 0.0)
+        raw_quantity = int(sell_value // reference_price)
+        sell_quantity = (raw_quantity // resolved_lot_size) * resolved_lot_size
+        return min(sell_quantity, position_quantity)
+
+    @staticmethod
+    def _index_slot_virtual_unit(metadata: dict | None = None, *, position=None) -> float:
+        for source in (metadata, getattr(position, "metadata", None)):
+            if not source:
+                continue
+            value = source.get("index_virtual_unit")
+            if value is None:
+                continue
+            unit = pd.to_numeric(value, errors="coerce")
+            if pd.notna(unit) and float(unit) > 0:
+                return float(unit)
+        return 1.0
+
+    def _index_slot_virtual_lot_size(self, virtual_unit: float) -> int:
+        return 1 if virtual_unit != 1.0 else self.config.lot_size
+
+    def _index_slot_virtual_config(self, virtual_unit: float) -> EngineConfig:
+        if virtual_unit == 1.0 and self.config.lot_size == self._index_slot_virtual_lot_size(virtual_unit):
+            return self.config
+        return replace(self.config, lot_size=self._index_slot_virtual_lot_size(virtual_unit))
+
+    def _scale_index_slot_execution_frame(
+        self,
+        frame: pd.DataFrame,
+        virtual_unit: float,
+        metadata: dict | None = None,
+    ) -> pd.DataFrame:
+        if virtual_unit == 1.0:
+            return frame
+
+        scaled = frame.copy()
+        price_columns = ("open", "high", "low", "close", "preclose")
+        for column in price_columns:
+            if column in scaled.columns:
+                scaled[column] = pd.to_numeric(scaled[column], errors="coerce") * virtual_unit
+
+        row = first_sorted_row(frame)
+        if metadata is not None and row is not None:
+            raw_price = None
+            for column in ("open", "close"):
+                if column in row and pd.notna(row[column]):
+                    raw_price = float(row[column])
+                    break
+            if raw_price is not None and raw_price > 0:
+                metadata["raw_index_price"] = raw_price
+                metadata["scaled_index_price"] = raw_price * virtual_unit
+        return scaled
+
+    @staticmethod
+    def _index_slot_rebalance_fallback_price(position) -> float | None:
+        for value in (getattr(position, "last_price", None), getattr(position, "entry_price", None)):
+            price = pd.to_numeric(value, errors="coerce")
+            if pd.notna(price) and float(price) > 0:
+                return float(price)
+        return None
 
     def _estimate_risk_budget(
         self,

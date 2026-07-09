@@ -1,6 +1,7 @@
 """共享工具导出。"""
 
-from .config_loader import load_ini_section, parse_bool, project_root_from
+from .config_loader import load_ini_section, parse_bool, parse_bool_strict, project_root_from
+from .dataframe_cache import json_ready
 from .datetime_utils import (
     combine_trade_date,
     date_text,
@@ -35,6 +36,7 @@ from .security_code import (
     to_xt_code,
 )
 from .security_status import is_delisted_basic_doc, is_st_name, parse_basic_date
+from .scalar_utils import is_blank, safe_float, safe_int
 
 __all__ = [
     "combine_trade_date",
@@ -46,15 +48,18 @@ __all__ = [
     "is_bj_code",
     "is_hs_a_share_code",
     "is_index_code",
+    "is_blank",
     "is_supported_a_stock_xt_code",
     "iter_quarter_pairs",
     "iter_quarters",
+    "json_ready",
     "load_ini_section",
     "merge_metadata",
     "next_quarter",
     "normalize_internal_code",
     "plain_code",
     "parse_bool",
+    "parse_bool_strict",
     "parse_basic_date",
     "project_root_from",
     "quarter_end",
@@ -63,6 +68,8 @@ __all__ = [
     "resolve_incremental_target_quarter",
     "split_code_list",
     "sort_frame",
+    "safe_float",
+    "safe_int",
     "is_delisted_basic_doc",
     "is_st_name",
     "to_akshare_em_symbol",

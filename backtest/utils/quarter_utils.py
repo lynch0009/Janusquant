@@ -48,7 +48,7 @@ def resolve_incremental_target_quarter(today: datetime) -> tuple[int, int]:
     month = today.month
     if month <= 3:
         return today.year - 1, 3
-    if month <= 7:
+    if month <= 6:
         return today.year, 1
     if month <= 9:
         return today.year, 2

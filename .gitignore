@@ -28,6 +28,7 @@ private_archive/
 deploy/*.local.yml
 config/*.conf
 !config/*.example.conf
+db_data/
 
 # Logs
 log/
@@ -38,15 +39,11 @@ backtest/log/
 backtest/runs/output/
 backtest/runs/cache/
 
-# Generated research artifacts
+# Generated research outputs and caches
 research/**/cache*/
 research/**/output_*/
 *.parquet
 *.png
-
-# Demo data packages
-examples/demo_mongo/data/
-examples/demo_mongo/*.zip
 
 # Build / packaging
 build/

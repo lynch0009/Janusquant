@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime
 from hashlib import sha1
 import json
@@ -15,16 +15,27 @@ import pandas as pd
 
 
 def json_ready(value: Any) -> Any:
+    if is_dataclass(value):
+        return json_ready(asdict(value))
     if isinstance(value, (datetime, date, pd.Timestamp)):
         return pd.Timestamp(value).isoformat()
     if isinstance(value, Path):
         return str(value)
+    if hasattr(value, "item") and type(value).__module__.startswith("numpy"):
+        return json_ready(value.item())
+    if value is pd.NA or value is pd.NaT:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
     if isinstance(value, dict):
-        return {str(key): json_ready(value[key]) for key in sorted(value)}
+        return {str(key): json_ready(value[key]) for key in sorted(value, key=lambda item: str(item))}
     if isinstance(value, (list, tuple)):
         return [json_ready(item) for item in value]
     if isinstance(value, set):
-        return sorted(json_ready(item) for item in value)
+        return sorted(
+            (json_ready(item) for item in value),
+            key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=True, default=str),
+        )
     return value
 
 

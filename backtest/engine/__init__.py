@@ -1,7 +1,7 @@
 """兼容导出层。"""
 
 from backtest.analytics import BacktestAnalyzer, BacktestAnalyticsReport
-from backtest.data import MongoDataPortal
+from backtest.data import DuckDBDataPortal
 from backtest.execution import (
     BaseExecutionModel,
     BaseMinuteExecutor,
@@ -36,10 +36,11 @@ from backtest.risk import (
 )
 from backtest.strategies import (
     BaseSelectionStrategy,
+    ConceptBoardStrengthStrategy,
     DailyCandidate,
-    MinerviniAshareStrategy,
-    SmallCapAmountShockReversalStrategy,
-    SmallCapLiquidityRotationStrategy,
+    StaticUniverseStrategy,
+    TopKFeatureStrategy,
+    TrainLeaderStrategy,
 )
 
 __all__ = [
@@ -55,6 +56,7 @@ __all__ = [
     "BreakEvenExitPolicy",
     "CloseBelowMaExitPolicy",
     "CompositeExitPolicy",
+    "ConceptBoardStrengthStrategy",
     "DailyBarExecutor",
     "DailyCandidate",
     "EngineConfig",
@@ -66,15 +68,15 @@ __all__ = [
     "FixedPriceExitPolicy",
     "FixedFractionSizer",
     "FixedStopLossExitPolicy",
-    "MongoDataPortal",
+    "DuckDBDataPortal",
     "PortfolioLedger",
     "SignalDrivenBacktestEngine",
-    "MinerviniAshareStrategy",
-    "SmallCapAmountShockReversalStrategy",
-    "SmallCapLiquidityRotationStrategy",
+    "StaticUniverseStrategy",
     "StockOrder",
     "StockPosition",
     "TimeExitPolicy",
+    "TopKFeatureStrategy",
     "TradeRecord",
+    "TrainLeaderStrategy",
     "WindowFirstBarExecutor",
 ]

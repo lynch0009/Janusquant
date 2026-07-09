@@ -24,15 +24,20 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
         liquidity_window: int = 20,
         min_avg_amount: float | None = 30_000_000,
         min_avg_turn: float | None = 1.0,
-        exclude_bottom_liquidity_pct: float = 0.15,
+        exclude_bottom_liquidity_pct: float | None = 0.15,
         exclude_bottom_liquidity_metric: str = "amount",
-        min_close_price: float | None = None,
+        min_close_price: float | None = 1.5,
+        st_lookback_trade_days: int | None = 100,
         factor_filter_enabled: bool = False,
         hhv_window: int = 60,
         hhv_group_count: int = 5,
         hhv_keep_groups: Sequence[int] = (2, 3, 4),
         amount_expand_fast_window: int = 5,
         amount_expand_slow_window: int = 20,
+        ret_window: int = 10,
+        min_research_ret_10d: float | None = None,
+        signal_price_mode: str = "hfq",
+        selection_sort: str = "cap_asc",
         factor_sort_enabled: bool = False,
         amount_expand_descending: bool = False,
     ):
@@ -46,11 +51,16 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
         self.liquidity_window = liquidity_window
         self.min_avg_amount = min_avg_amount
         self.min_avg_turn = self._normalize_turn_threshold(min_avg_turn)
-        self.exclude_bottom_liquidity_pct = max(min(float(exclude_bottom_liquidity_pct), 1.0), 0.0)
+        self.exclude_bottom_liquidity_pct = (
+            None
+            if exclude_bottom_liquidity_pct is None
+            else max(min(float(exclude_bottom_liquidity_pct), 1.0), 0.0)
+        )
         self.exclude_bottom_liquidity_metric = str(exclude_bottom_liquidity_metric).lower()
         if self.exclude_bottom_liquidity_metric not in {"amount", "volume"}:
             raise ValueError("exclude_bottom_liquidity_metric must be one of: amount, volume")
-        self.min_close_price = min_close_price
+        self.min_close_price = None if min_close_price is None else float(min_close_price)
+        self.st_lookback_trade_days = None if st_lookback_trade_days is None else int(st_lookback_trade_days)
         self.factor_filter_enabled = bool(factor_filter_enabled)
         self.factor_sort_enabled = bool(factor_sort_enabled)
         self.amount_expand_descending = bool(amount_expand_descending)
@@ -59,6 +69,10 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
         self.hhv_keep_groups = self._normalize_hhv_keep_groups(hhv_keep_groups)
         self.amount_expand_fast_window = int(amount_expand_fast_window)
         self.amount_expand_slow_window = int(amount_expand_slow_window)
+        self.ret_window = int(ret_window)
+        self.min_research_ret_10d = None if min_research_ret_10d is None else float(min_research_ret_10d)
+        self.signal_price_mode = str(signal_price_mode or "hfq").strip().lower()
+        self.selection_sort = str(selection_sort or "cap_asc").strip().lower()
         self._validate_factor_parameters()
 
     def required_feature_fields(self) -> Sequence[str]:
@@ -78,6 +92,20 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
             raise ValueError("amount_expand_fast_window must be >= 1")
         if self.amount_expand_slow_window < self.amount_expand_fast_window:
             raise ValueError("amount_expand_slow_window must be >= amount_expand_fast_window")
+        if self.ret_window < 1:
+            raise ValueError("ret_window must be >= 1")
+        if self.selection_sort not in {"cap_asc", "ret_desc"}:
+            raise ValueError("selection_sort must be one of: cap_asc, ret_desc")
+        if self.signal_price_mode not in {"raw", "qfq", "hfq"}:
+            raise ValueError("signal_price_mode must be one of: raw, qfq, hfq")
+        if self.selection_sort == "ret_desc" and self.factor_sort_enabled:
+            raise ValueError("selection_sort=ret_desc cannot be combined with factor_sort_enabled")
+        if self.min_close_price is not None and self.min_close_price <= 0:
+            raise ValueError("min_close_price must be positive")
+        if self.min_research_ret_10d is not None and not math.isfinite(self.min_research_ret_10d):
+            raise ValueError("min_research_ret_10d must be finite")
+        if self.st_lookback_trade_days is not None and self.st_lookback_trade_days < 0:
+            raise ValueError("st_lookback_trade_days must be >= 0")
 
     @staticmethod
     def _normalize_hhv_keep_groups(raw_groups: Sequence[int] | str) -> tuple[int, ...]:
@@ -142,7 +170,13 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
         return to_pydatetime(full_trade_calendar[warmup_index])
 
     def _factor_warmup_window(self) -> int:
-        return max(self.liquidity_window, self.hhv_window, self.amount_expand_slow_window)
+        return max(
+            self.liquidity_window,
+            self.hhv_window,
+            self.amount_expand_slow_window,
+            self.ret_window,
+            self.st_lookback_trade_days or 0,
+        )
 
     def _prepare_base_feature_frame(
         self,
@@ -272,7 +306,20 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
             return {}
 
         final_frame = frame.copy()
-        if self.factor_sort_enabled:
+        if self.selection_sort == "ret_desc":
+            required_columns = {"trade_date", "code", self.cap_field, "research_ret_10d"}
+            missing_columns = [column for column in sorted(required_columns) if column not in final_frame.columns]
+            if missing_columns:
+                raise KeyError(
+                    "Selection sort missing required columns: "
+                    f"{missing_columns}. Available columns: {sorted(final_frame.columns.tolist())}"
+                )
+            final_frame = final_frame.dropna(subset=["research_ret_10d"]).copy()
+            final_frame = final_frame.sort_values(
+                ["trade_date", "research_ret_10d", self.cap_field, "code"],
+                ascending=[True, False, True, True],
+            )
+        elif self.factor_sort_enabled:
             required_columns = {"trade_date", "code", self.cap_field, "amount_expand"}
             missing_columns = [column for column in sorted(required_columns) if column not in final_frame.columns]
             if missing_columns:
@@ -304,7 +351,7 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
         frame_cache = getattr(data_portal, "frame_cache", None)
         if frame_cache is not None:
             payload = {
-                "feature_formula_version": "liquidity_indicator_v2",
+                "feature_formula_version": "liquidity_indicator_v4",
                 "warmup_start": warmup_start,
                 "signal_end": signal_end,
                 "codes_signature": frame_cache.codes_signature(codes),
@@ -312,7 +359,10 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
                 "hhv_window": self.hhv_window,
                 "amount_expand_fast_window": self.amount_expand_fast_window,
                 "amount_expand_slow_window": self.amount_expand_slow_window,
-                "price_mode": "raw",
+                "ret_window": self.ret_window,
+                "st_lookback_trade_days": self.st_lookback_trade_days,
+                "signal_price_mode": self.signal_price_mode,
+                "raw_price_mode": "raw",
             }
             return frame_cache.load_or_build_frame(
                 "liquidity_indicator_frame",
@@ -352,7 +402,7 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
                 codes=codes,
                 fields=fields,
                 include_stopped=False,
-                price_mode="raw",
+                price_mode=self.signal_price_mode,
                 batch_size=1000,
             )
         else:
@@ -362,15 +412,52 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
                 codes=codes,
                 fields=fields,
                 include_stopped=False,
-                price_mode="raw",
+                price_mode=self.signal_price_mode,
                 batch_size=1000,
             )
         if daily_history.empty:
             return pd.DataFrame()
 
+        raw_history_fields = ["code", "trade_date", "close"]
+        if self.signal_price_mode == "raw":
+            raw_history = pd.DataFrame()
+        elif research_store is not None:
+            raw_history = research_store.load_daily_history(
+                warmup_start,
+                history_end,
+                codes=codes,
+                fields=raw_history_fields,
+                include_stopped=False,
+                price_mode="raw",
+                batch_size=1000,
+            )
+        else:
+            raw_history = data_portal.get_daily_history(
+                warmup_start,
+                history_end,
+                codes=codes,
+                fields=raw_history_fields,
+                include_stopped=False,
+                price_mode="raw",
+                batch_size=1000,
+            )
+
         daily_history = daily_history.copy()
         daily_history["trade_date"] = pd.to_datetime(daily_history["trade_date"])
         daily_history = daily_history.sort_values(["code", "trade_date"]).reset_index(drop=True)
+        if raw_history.empty:
+            daily_history["raw_close"] = daily_history["close"]
+        else:
+            raw_history = raw_history.copy()
+            raw_history["trade_date"] = pd.to_datetime(raw_history["trade_date"])
+            raw_history = raw_history.rename(columns={"close": "raw_close"})
+            daily_history = daily_history.merge(
+                raw_history[["code", "trade_date", "raw_close"]],
+                on=["code", "trade_date"],
+                how="left",
+            )
+            daily_history["raw_close"] = daily_history["raw_close"].fillna(daily_history["close"])
+        daily_history["raw_close"] = pd.to_numeric(daily_history["raw_close"], errors="coerce")
 
         grouped = daily_history.groupby("code")
         amount_windows = sorted({self.liquidity_window, self.amount_expand_fast_window, self.amount_expand_slow_window})
@@ -396,6 +483,20 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
         amount_denominator = daily_history[self.amount_expand_slow_col].replace(0, pd.NA)
         daily_history["amount_expand"] = daily_history[self.amount_expand_fast_col] / amount_denominator
         daily_history["research_amount_expand"] = -daily_history["amount_expand"]
+        shifted_close = grouped["close"].shift(self.ret_window)
+        daily_history["ret_10d"] = daily_history["close"] / shifted_close.where(shifted_close != 0) - 1.0
+        daily_history["research_ret_10d"] = -daily_history["ret_10d"]
+        daily_history["isST"] = daily_history["isST"].fillna(False).astype(bool)
+        lookback_window = self.st_lookback_trade_days or 0
+        if lookback_window > 0:
+            daily_history["is_st_lookback_flag"] = (
+                grouped["isST"]
+                .transform(lambda values: values.astype(float).rolling(lookback_window, min_periods=1).max())
+                .fillna(0)
+                .astype(bool)
+            )
+        else:
+            daily_history["is_st_lookback_flag"] = False
         return daily_history
 
     def _apply_liquidity_filter(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -407,10 +508,11 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
         turn_col = f"avg_turn_{self.liquidity_window}d"
         metric_col = amount_col if self.exclude_bottom_liquidity_metric == "amount" else volume_col
         required_columns = {"trade_date", "code", amount_col, turn_col}
-        if self.exclude_bottom_liquidity_pct > 0:
+        exclude_bottom_liquidity_pct = self.exclude_bottom_liquidity_pct or 0.0
+        if exclude_bottom_liquidity_pct > 0:
             required_columns.add(metric_col)
         if self.min_close_price is not None:
-            required_columns.add("close")
+            required_columns.add("raw_close")
         missing_columns = [column for column in sorted(required_columns) if column not in frame.columns]
         if missing_columns:
             raise KeyError(
@@ -422,17 +524,17 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
             filtered = filtered[filtered[amount_col] >= self.min_avg_amount].copy()
         if self.min_avg_turn is not None:
             filtered = filtered[filtered[turn_col] >= self.min_avg_turn].copy()
-        if self.exclude_bottom_liquidity_pct > 0 and not filtered.empty:
+        if exclude_bottom_liquidity_pct > 0 and not filtered.empty:
             filtered = filtered.sort_values(["trade_date", metric_col, "code"], ascending=[True, True, True]).copy()
             filtered["_liquidity_rank"] = filtered.groupby("trade_date").cumcount()
             filtered["_liquidity_group_size"] = filtered.groupby("trade_date")["code"].transform("size")
             filtered["_liquidity_exclude_count"] = (
-                filtered["_liquidity_group_size"] * self.exclude_bottom_liquidity_pct
+                filtered["_liquidity_group_size"] * exclude_bottom_liquidity_pct
             ).apply(math.ceil).astype(int)
             filtered = filtered[filtered["_liquidity_rank"] >= filtered["_liquidity_exclude_count"]].copy()
             filtered = filtered.drop(columns=["_liquidity_rank", "_liquidity_group_size", "_liquidity_exclude_count"])
         if self.min_close_price is not None:
-            filtered = filtered[filtered["close"] >= self.min_close_price].copy()
+            filtered = filtered[pd.to_numeric(filtered["raw_close"], errors="coerce") > self.min_close_price].copy()
         return filtered
 
     def _apply_factor_filter(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -460,6 +562,21 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
         filtered["hhv_group"] = pd.array(bucket_series, dtype="Int8")
         filtered = filtered[filtered["hhv_group"].isin(self.hhv_keep_groups)].copy()
         return filtered
+
+    def _apply_research_ret_filter(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty or self.min_research_ret_10d is None:
+            return frame
+
+        required_columns = {"trade_date", "code", "research_ret_10d"}
+        missing_columns = [column for column in sorted(required_columns) if column not in frame.columns]
+        if missing_columns:
+            raise KeyError(
+                "Research return filter missing required columns: "
+                f"{missing_columns}. Available columns: {sorted(frame.columns.tolist())}"
+            )
+
+        filtered = frame.dropna(subset=["research_ret_10d"]).copy()
+        return filtered[filtered["research_ret_10d"] >= self.min_research_ret_10d].copy()
 
     def prepare(self, data_portal, trade_dates: Sequence[datetime], *, research_store=None) -> None:
         self.reset_signal_table()
@@ -489,7 +606,12 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
             return
 
         frame = frame[frame["isST"].fillna(False) == False].copy()
+        if self.st_lookback_trade_days:
+            frame = frame[frame["is_st_lookback_flag"].fillna(False) == False].copy()
         frame = self._apply_liquidity_filter(frame)
+        if frame.empty:
+            return
+        frame = self._apply_research_ret_filter(frame)
         if frame.empty:
             return
         frame = self._apply_factor_filter(frame)
@@ -517,6 +639,18 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
                 self.cap_field: float(getattr(row, self.cap_field)),
                 "close": float(row.close),
             }
+            raw_close = getattr(row, "raw_close", None)
+            if pd.notna(raw_close):
+                metadata["raw_close"] = float(raw_close)
+            if self.st_lookback_trade_days:
+                metadata["st_lookback_trade_days"] = self.st_lookback_trade_days
+            if self.min_close_price is not None:
+                metadata["min_close_price"] = self.min_close_price
+            if self.min_research_ret_10d is not None:
+                metadata["min_research_ret_10d"] = self.min_research_ret_10d
+            st_lookback_flag = getattr(row, "is_st_lookback_flag", None)
+            if pd.notna(st_lookback_flag):
+                metadata["is_st_lookback_flag"] = bool(st_lookback_flag)
             amount_value = getattr(row, amount_col, None)
             volume_value = getattr(row, volume_col, None)
             turn_value = getattr(row, turn_col, None)
@@ -526,8 +660,12 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
                 metadata[volume_col] = float(volume_value)
             if pd.notna(turn_value):
                 metadata[turn_col] = float(turn_value)
+            metadata["selection_sort"] = self.selection_sort
+            metadata["signal_price_mode"] = self.signal_price_mode
             self._safe_float_metadata(metadata, "distance_to_hhv", getattr(row, self.distance_to_hhv_col, None))
             self._safe_float_metadata(metadata, "research_distance_to_hhv", getattr(row, self.research_distance_to_hhv_col, None))
+            self._safe_float_metadata(metadata, "ret_10d", getattr(row, "ret_10d", None))
+            self._safe_float_metadata(metadata, "research_ret_10d", getattr(row, "research_ret_10d", None))
             hhv_group_value = getattr(row, "hhv_group", None)
             if pd.notna(hhv_group_value):
                 metadata["hhv_group"] = int(hhv_group_value)
@@ -535,12 +673,19 @@ class SmallCapLiquidityRotationStrategy(SmallCapSignalTableStrategy):
             self._safe_float_metadata(metadata, "research_amount_expand", getattr(row, "research_amount_expand", None))
             self._safe_float_metadata(metadata, self.amount_expand_fast_col, getattr(row, self.amount_expand_fast_col, None))
             self._safe_float_metadata(metadata, self.amount_expand_slow_col, getattr(row, self.amount_expand_slow_col, None))
+            if self.selection_sort == "ret_desc":
+                score = float(getattr(row, "research_ret_10d"))
+            elif self.factor_sort_enabled:
+                score = float(getattr(row, "amount_expand"))
+            else:
+                score = float(getattr(row, self.cap_field))
+            metadata["selection_sort_score"] = score
 
             candidates.append(
                 DailyCandidate(
                     signal_date=signal_date,
                     code=row.code,
-                    score=float(getattr(row, "amount_expand")) if self.factor_sort_enabled else float(getattr(row, self.cap_field)),
+                    score=score,
                     hold_days=self.hold_days,
                     metadata=metadata,
                 )

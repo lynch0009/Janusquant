@@ -15,6 +15,8 @@ __all__ = [
     "SignalDrivenBacktestEngine",
     "WindowFirstBarExecutor",
     "build_exit_trade_from_price",
+    "calculate_entry_quantity",
+    "calculate_required_cash",
 ]
 
 
@@ -25,6 +27,17 @@ def __getattr__(name: str):
         from .engine import SignalDrivenBacktestEngine
 
         return SignalDrivenBacktestEngine
+    if name in {
+        "calculate_entry_quantity",
+        "calculate_required_cash",
+    }:
+        from .trading import calculate_entry_quantity, calculate_required_cash
+
+        exports = {
+            "calculate_entry_quantity": calculate_entry_quantity,
+            "calculate_required_cash": calculate_required_cash,
+        }
+        return exports[name]
     if name in {
         "BaseExecutionModel",
         "BaseMinuteExecutor",

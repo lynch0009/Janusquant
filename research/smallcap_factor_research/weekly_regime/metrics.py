@@ -60,73 +60,18 @@ class WeeklyMetricSuite:
             condition_col = f"condition_{condition}"
             selected = panel[panel[condition_col].fillna(False)].copy()
             for factor in self.factor_names:
-                ranked = selected.dropna(subset=[factor]).sort_values(
-                    [*keys, factor, "code"],
-                    ascending=[*[True] * len(keys), False, True],
-                    kind="mergesort",
-                ).copy()
+                ranked = self._rank_factor_panel(selected, keys, factor)
                 if ranked.empty:
                     continue
-                grouped = ranked.groupby(keys, sort=False, observed=True)
-                ranked["rank_desc"] = grouped.cumcount() + 1
-                ranked["sample_count"] = grouped[factor].transform("size")
 
                 for horizon in request.study.horizons:
                     label = f"fwd_ret_{horizon}d"
-                    valid = ranked.dropna(subset=[label]).copy()
-                    if valid.empty:
-                        continue
-                    valid["_score_rank"] = valid.groupby(keys, observed=True)[factor].rank(method="average")
-                    valid["_label_rank"] = valid.groupby(keys, observed=True)[label].rank(method="average")
-                    for group_key, section in valid.groupby(keys, observed=True):
-                        if len(section) < 8:
-                            continue
-                        row = _key_values(keys, group_key)
-                        row.update({
-                            "factor_name": factor,
-                            "condition_name": condition,
-                            "horizon": horizon,
-                            "rank_ic": section["_score_rank"].corr(section["_label_rank"]),
-                            "sample_count": len(section),
-                        })
-                        ic_rows.append(row)
-
-                    for top_n in self.top_ns:
-                        top = valid[valid["rank_desc"] <= top_n]
-                        for group_key, section in top.groupby(keys, observed=True):
-                            row = _key_values(keys, group_key)
-                            row.update({
-                                "factor_name": factor,
-                                "condition_name": condition,
-                                "horizon": horizon,
-                                "top_n": top_n,
-                                "forward_return": section[label].mean(),
-                                "selected_count": len(section),
-                            })
-                            daily_top_rows.append(row)
-
-                    bucketable = valid[valid["sample_count"] >= self.bucket_count].copy()
-                    bucketable["bucket_id"] = (
-                        np.floor(
-                            (bucketable["rank_desc"] - 1)
-                            * self.bucket_count
-                            / bucketable["sample_count"]
-                        ).astype(int)
-                        + 1
-                    )
-                    daily_bucket = bucketable.groupby(
-                        [*keys, "bucket_id"], observed=True
-                    )[label].mean().reset_index()
-                    for row in daily_bucket.itertuples(index=False):
-                        values = {name: getattr(row, name) for name in keys}
-                        values.update({
-                            "factor_name": factor,
-                            "condition_name": condition,
-                            "horizon": horizon,
-                            "bucket_id": int(row.bucket_id),
-                            "forward_return": getattr(row, label),
-                        })
-                        bucket_rows.append(values)
+                    valid = self._valid_horizon_frame(ranked, keys, factor, label)
+                    ic_rows.extend(_rank_ic_rows(valid, keys, factor=factor, condition=condition, horizon=horizon))
+                    daily_top_rows.extend(_topn_rows(valid, keys, factor=factor, condition=condition,
+                                                     horizon=horizon, label=label, top_ns=self.top_ns))
+                    bucket_rows.extend(_bucket_rows(valid, keys, factor=factor, condition=condition,
+                                                    horizon=horizon, label=label, bucket_count=self.bucket_count))
 
                 overlap_rows.extend(
                     self._overlap(ranked, keys, factor=factor, condition=condition, benchmark=benchmark)
@@ -157,6 +102,35 @@ class WeeklyMetricSuite:
         }
         return outputs, summary
 
+    @staticmethod
+    def _rank_factor_panel(frame: pd.DataFrame, keys: list[str], factor: str) -> pd.DataFrame:
+        ranked = frame.copy()
+        ranked[factor] = pd.to_numeric(ranked[factor], errors="coerce")
+        ranked = ranked.dropna(subset=[factor]).sort_values(
+            [*keys, factor, "code"],
+            ascending=[*[True] * len(keys), False, True],
+            kind="mergesort",
+        ).copy()
+        if ranked.empty:
+            return ranked
+        grouped = ranked.groupby(keys, sort=False, observed=True)
+        ranked["rank_desc"] = grouped.cumcount() + 1
+        ranked["sample_count"] = grouped[factor].transform("size")
+        return ranked
+
+    @staticmethod
+    def _valid_horizon_frame(ranked: pd.DataFrame, keys: list[str], factor: str, label: str) -> pd.DataFrame:
+        if ranked.empty:
+            return ranked
+        valid = ranked.copy()
+        valid[label] = pd.to_numeric(valid[label], errors="coerce")
+        valid = valid.dropna(subset=[label]).copy()
+        if valid.empty:
+            return valid
+        valid["_score_rank"] = valid.groupby(keys, observed=True)[factor].rank(method="average")
+        valid["_label_rank"] = valid.groupby(keys, observed=True)[label].rank(method="average")
+        return valid
+
     def _condition_coverage(self, panel: pd.DataFrame) -> pd.DataFrame:
         rows = []
         denominator = len(panel)
@@ -181,11 +155,21 @@ class WeeklyMetricSuite:
         frame = pd.read_csv(path)
         if frame.empty or not {"trade_date", "code"}.issubset(frame):
             return {}
-        frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce").dt.normalize()
+        frame["trade_date"] = pd.to_datetime(
+            frame["trade_date"].astype(str).str.slice(0, 10),
+            errors="coerce",
+            format="%Y-%m-%d",
+        ).dt.normalize()
+        frame = frame.dropna(subset=["trade_date", "code"]).copy()
+        if frame.empty:
+            return {}
         if "fill_rank" not in frame:
             frame = frame.sort_values(["trade_date", "code"], kind="mergesort")
             frame["fill_rank"] = frame.groupby("trade_date", observed=True).cumcount() + 1
         frame["fill_rank"] = pd.to_numeric(frame["fill_rank"], errors="coerce")
+        frame = frame.dropna(subset=["fill_rank"]).copy()
+        if frame.empty:
+            return {}
         return {
             top_n: {
                 pd.Timestamp(date): set(section["code"].astype(str))
@@ -207,8 +191,9 @@ class WeeklyMetricSuite:
             for top_n in self.top_ns:
                 counts, ratios = [], []
                 selected = partition[partition["rank_desc"] <= top_n]
+                expected_by_date = benchmark.get(top_n, {})
                 for trade_date, section in selected.groupby("trade_date", observed=True):
-                    expected = benchmark[top_n].get(pd.Timestamp(trade_date), set())
+                    expected = expected_by_date.get(pd.Timestamp(trade_date), set())
                     if not expected:
                         continue
                     codes = set(section["code"].astype(str))
@@ -227,6 +212,69 @@ class WeeklyMetricSuite:
                     row["weekday"] = int(weekday)
                 rows.append(row)
         return rows
+
+
+def _rank_ic_rows(frame, keys, *, factor, condition, horizon):
+    if frame.empty:
+        return []
+    rows = []
+    for group_key, section in frame.groupby(keys, observed=True):
+        if len(section) < 8:
+            continue
+        row = _key_values(keys, group_key)
+        row.update({
+            "factor_name": factor,
+            "condition_name": condition,
+            "horizon": horizon,
+            "rank_ic": section["_score_rank"].corr(section["_label_rank"]),
+            "sample_count": len(section),
+        })
+        rows.append(row)
+    return rows
+
+
+def _topn_rows(frame, keys, *, factor, condition, horizon, label, top_ns):
+    if frame.empty:
+        return []
+    rows = []
+    for top_n in top_ns:
+        top = frame[frame["rank_desc"] <= top_n]
+        for group_key, section in top.groupby(keys, observed=True):
+            row = _key_values(keys, group_key)
+            row.update({
+                "factor_name": factor,
+                "condition_name": condition,
+                "horizon": horizon,
+                "top_n": top_n,
+                "forward_return": section[label].mean(),
+                "selected_count": len(section),
+            })
+            rows.append(row)
+    return rows
+
+
+def _bucket_rows(frame, keys, *, factor, condition, horizon, label, bucket_count):
+    if frame.empty:
+        return []
+    bucketable = frame[frame["sample_count"] >= bucket_count].copy()
+    if bucketable.empty:
+        return []
+    bucketable["bucket_id"] = (
+        np.floor((bucketable["rank_desc"] - 1) * bucket_count / bucketable["sample_count"]).astype(int) + 1
+    )
+    daily_bucket = bucketable.groupby([*keys, "bucket_id"], observed=True)[label].mean().reset_index()
+    rows = []
+    for row in daily_bucket.itertuples(index=False):
+        values = {name: getattr(row, name) for name in keys}
+        values.update({
+            "factor_name": factor,
+            "condition_name": condition,
+            "horizon": horizon,
+            "bucket_id": int(row.bucket_id),
+            "forward_return": getattr(row, label),
+        })
+        rows.append(values)
+    return rows
 
 
 def _key_values(keys, value):

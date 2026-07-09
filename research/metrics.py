@@ -169,7 +169,7 @@ class FactorPersistenceMetric(BaseMetric):
         date_index = {pd.Timestamp(value): index for index, value in enumerate(dates)}
         for feature in request.study.features:
             score = research_column(feature)
-            ranked = context.sorted_panel(score)
+            ranked = context.sorted_panel(score).copy()
             ranked["top_count"] = np.maximum(1, np.floor(ranked["sample_count"] * request.study.top_pct)).astype(int)
             selected = ranked[ranked["rank_desc"] <= ranked["top_count"]]
             sets = {pd.Timestamp(date): set(section["code"].astype(str)) for date, section in selected.groupby("trade_date", observed=True)}

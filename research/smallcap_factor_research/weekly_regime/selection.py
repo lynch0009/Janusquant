@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from backtest.utils.config_loader import parse_bool
 from research.models import ResearchRequest
 from research.validation import require_columns
 
@@ -16,8 +17,7 @@ from .config import validate_weekday
 def to_bool(series: pd.Series) -> pd.Series:
     if series.dtype == bool:
         return series.fillna(False)
-    normalized = series.astype(str).str.strip().str.lower()
-    return normalized.isin({"true", "1", "yes", "y"})
+    return series.map(lambda value: parse_bool(value, default=False)).astype(bool)
 
 
 def load_regime_state(regime_run_dir: Path) -> pd.DataFrame:

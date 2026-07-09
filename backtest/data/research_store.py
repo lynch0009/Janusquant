@@ -11,7 +11,7 @@ from typing import Sequence
 
 import pandas as pd
 
-from backtest.db import normalize_code
+from backtest.utils import normalize_internal_code
 
 
 @dataclass
@@ -38,7 +38,7 @@ class CachedDailyHistory:
     ) -> bool:
         """判断当前缓存是否完整覆盖一次新的研究请求。"""
 
-        requested_codes = {normalize_code(code) for code in codes}
+        requested_codes = {normalize_internal_code(code) for code in codes}
         requested_fields = set(fields) | {"code", "trade_date"}
         return (
             self.price_mode == price_mode
@@ -68,7 +68,7 @@ class CachedVisibleFinance:
         codes: Sequence[str],
         fields: Sequence[str],
     ) -> bool:
-        requested_codes = {normalize_code(code) for code in codes}
+        requested_codes = {normalize_internal_code(code) for code in codes}
         requested_fields = set(fields) | {"code", "pubDate", "statDate"}
         return (
             self.as_of == as_of
@@ -99,7 +99,7 @@ class CachedFinanceReports:
         codes: Sequence[str],
         fields: Sequence[str],
     ) -> bool:
-        requested_codes = {normalize_code(code) for code in codes}
+        requested_codes = {normalize_internal_code(code) for code in codes}
         requested_fields = set(fields) | {"code", "pubDate", "statDate"}
         start_ok = self.start_pub_date is None or (start_pub_date is not None and self.start_pub_date <= start_pub_date)
         end_ok = self.end_pub_date is None or (end_pub_date is not None and self.end_pub_date >= end_pub_date)
@@ -126,7 +126,7 @@ class CachedMinerviniFundamentalFeatures:
         codes: Sequence[str],
         fields: Sequence[str],
     ) -> bool:
-        requested_codes = {normalize_code(code) for code in codes}
+        requested_codes = {normalize_internal_code(code) for code in codes}
         requested_fields = set(fields) | {"code", "pubDate", "statDate", "featureVersion"}
         start_ok = self.start_pub_date is None or (start_pub_date is not None and self.start_pub_date <= start_pub_date)
         end_ok = self.end_pub_date is None or (end_pub_date is not None and self.end_pub_date >= end_pub_date)
@@ -184,7 +184,7 @@ class ResearchDailyHistoryStore:
         filtered = frame[
             (frame["trade_date"] >= pd.Timestamp(start_date))
             & (frame["trade_date"] < pd.Timestamp(end_date))
-            & (frame["code"].isin([normalize_code(code) for code in codes]))
+            & (frame["code"].isin([normalize_internal_code(code) for code in codes]))
         ].copy()
         available_fields = [field for field in fields if field in filtered.columns]
         return filtered[available_fields].sort_values(["code", "trade_date"]).reset_index(drop=True)
@@ -202,7 +202,7 @@ class ResearchDailyHistoryStore:
     ) -> pd.DataFrame:
         """读取研究日线，并优先复用已缓存的数据集。"""
 
-        normalized_codes = sorted({normalize_code(code) for code in codes})
+        normalized_codes = sorted({normalize_internal_code(code) for code in codes})
         normalized_fields = self._normalize_fields(fields)
         if not normalized_codes:
             return pd.DataFrame(columns=list(normalized_fields))
@@ -277,7 +277,7 @@ class ResearchDailyHistoryStore:
         if frame.empty:
             return pd.DataFrame(columns=list(fields))
 
-        filtered = frame[frame["code"].isin([normalize_code(code) for code in codes])].copy()
+        filtered = frame[frame["code"].isin([normalize_internal_code(code) for code in codes])].copy()
         available_fields = [field for field in fields if field in filtered.columns]
         sort_fields = [field for field in ("code", "pubDate", "statDate") if field in filtered.columns]
         return filtered[available_fields].sort_values(sort_fields).reset_index(drop=True)
@@ -294,7 +294,7 @@ class ResearchDailyHistoryStore:
         if frame.empty:
             return pd.DataFrame(columns=list(fields))
 
-        filtered = frame[frame["code"].isin([normalize_code(code) for code in codes])].copy()
+        filtered = frame[frame["code"].isin([normalize_internal_code(code) for code in codes])].copy()
         if start_pub_date is not None:
             filtered = filtered[filtered["pubDate"] >= pd.Timestamp(start_pub_date)]
         if end_pub_date is not None:
@@ -315,7 +315,7 @@ class ResearchDailyHistoryStore:
         if frame.empty:
             return pd.DataFrame(columns=list(fields))
 
-        filtered = frame[frame["code"].isin([normalize_code(code) for code in codes])].copy()
+        filtered = frame[frame["code"].isin([normalize_internal_code(code) for code in codes])].copy()
         if start_pub_date is not None:
             filtered = filtered[filtered["pubDate"] >= pd.Timestamp(start_pub_date)]
         if end_pub_date is not None:
@@ -334,7 +334,7 @@ class ResearchDailyHistoryStore:
     ) -> pd.DataFrame:
         """读取截至指定日期可见的财报，并优先复用缓存。"""
 
-        normalized_codes = sorted({normalize_code(code) for code in codes})
+        normalized_codes = sorted({normalize_internal_code(code) for code in codes})
         normalized_fields = self._normalize_finance_fields(fields)
         if not normalized_codes:
             return pd.DataFrame(columns=list(normalized_fields))
@@ -396,7 +396,7 @@ class ResearchDailyHistoryStore:
     ) -> pd.DataFrame:
         """???????????????????"""
 
-        normalized_codes = sorted({normalize_code(code) for code in codes})
+        normalized_codes = sorted({normalize_internal_code(code) for code in codes})
         normalized_fields = self._normalize_finance_fields(fields)
         if not normalized_codes:
             return pd.DataFrame(columns=list(normalized_fields))
@@ -464,7 +464,7 @@ class ResearchDailyHistoryStore:
     ) -> pd.DataFrame:
         """读取 Minervini 基本面特征时间线，并优先复用缓存。"""
 
-        normalized_codes = sorted({normalize_code(code) for code in codes})
+        normalized_codes = sorted({normalize_internal_code(code) for code in codes})
         normalized_fields = self._normalize_finance_fields(fields)
         if "featureVersion" not in normalized_fields:
             normalized_fields = tuple(list(normalized_fields) + ["featureVersion"])

@@ -10,8 +10,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from backtest.data import CachedMongoDataPortal, FrameCache, MongoDataPortal, ResearchDailyHistoryStore
-from backtest.db import MongoDBConfig
+from backtest.data import CachedDuckDBDataPortal, DuckDBDataPortal, FrameCache, ResearchDailyHistoryStore
+from backtest.db import DuckDBConfig
 from backtest.execution import EngineConfig, SignalDrivenBacktestEngine
 from backtest.execution.smallcap_rotation_executor import SmallCapRotationDailyOpenExecutor
 from backtest.portfolio import EqualSlotSizer
@@ -93,12 +93,12 @@ def main() -> None:
     hhv_keep_groups = parse_int_tuple(args.hhv_keep_groups)
     args.hhv_keep_groups = hhv_keep_groups
 
-    db_client = MongoDBConfig()
+    db_client = DuckDBConfig()
     frame_cache = None if args.disable_cache else FrameCache(DEFAULT_CACHE_DIR, version=args.cache_version)
     data_portal = (
-        MongoDataPortal(db_client)
+        DuckDBDataPortal(db_client)
         if frame_cache is None
-        else CachedMongoDataPortal(db_client, frame_cache=frame_cache)
+        else CachedDuckDBDataPortal(db_client, frame_cache=frame_cache)
     )
     trade_dates = data_portal.get_trade_calendar(start_date, requested_end_date)
     if not trade_dates:

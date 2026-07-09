@@ -9,8 +9,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from backtest.data import MongoDataPortal
-from backtest.db import MongoDBConfig
+from backtest.data import DuckDBDataPortal
+from backtest.db import DuckDBConfig
 from research.smallcap_factor_research.weekly_regime import (
     RegimeWeeklyFillResearchConfig,
     run_regime_weekly_fill_weekday_batch,
@@ -132,9 +132,9 @@ def main() -> None:
     args = parse_args()
     config = build_config(args)
     batch_weekdays = parse_weekdays(args.weekly_fill_weekdays)
-    db_client = MongoDBConfig()
+    db_client = DuckDBConfig()
     try:
-        portal = MongoDataPortal(db_client)
+        portal = DuckDBDataPortal(db_client)
         if batch_weekdays:
             result = run_regime_weekly_fill_weekday_batch(portal, config, weekdays=batch_weekdays)
         else:
@@ -142,7 +142,7 @@ def main() -> None:
         print(f"output_dir={result.output_dir.resolve()}")
         print(result.summary)
     finally:
-        db_client.client.close()
+        db_client.close()
 
 
 if __name__ == "__main__":

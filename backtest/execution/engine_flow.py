@@ -110,6 +110,19 @@ class EngineFlowMixin:
         """把调度到今天的候选转成真实买单并更新持仓。"""
 
         todays_candidates = pending_entries.pop(trade_date, [])
+        if hasattr(self.strategy, "prepare_before_entries"):
+            intents = self.strategy.prepare_before_entries(
+                trade_date,
+                ledger.snapshot(),
+                todays_candidates,
+            )
+            if intents:
+                self._process_index_slot_rebalance_intents(
+                    ledger,
+                    trade_index,
+                    trade_date,
+                    list(intents),
+                )
         if not todays_candidates:
             return
 

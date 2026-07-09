@@ -169,6 +169,7 @@ class EngineAccountingMixin:
                 for code, price in self.data_portal.get_daily_close_map(codes, trade_date).items()
                 if price is not None
             }
+            close_map = self._scale_close_map_for_virtual_positions(ledger, close_map)
 
         for code, position in ledger.positions.items():
             if code in close_map:
@@ -195,4 +196,33 @@ class EngineAccountingMixin:
         """按收盘价更新持仓和应收资产的总权益。"""
 
         close_map = self.data_portal.get_daily_close_map(ledger.valuation_codes(), trade_date)
+        close_map = self._scale_close_map_for_virtual_positions(ledger, close_map)
         ledger.mark_to_market(trade_date, close_map)
+
+    @staticmethod
+    def _virtual_price_unit(position) -> float:
+        value = getattr(position, "metadata", {}).get("index_virtual_unit")
+        if value is None:
+            return 1.0
+        try:
+            unit = float(value)
+        except (TypeError, ValueError):
+            return 1.0
+        return unit if unit > 0 else 1.0
+
+    def _scale_close_map_for_virtual_positions(
+        self,
+        ledger: PortfolioLedger,
+        close_map: dict[str, float],
+    ) -> dict[str, float]:
+        if not close_map:
+            return close_map
+        scaled = dict(close_map)
+        for code, position in ledger.positions.items():
+            unit = self._virtual_price_unit(position)
+            if unit == 1.0 or code not in scaled:
+                continue
+            price = scaled.get(code)
+            if price is not None:
+                scaled[code] = float(price) * unit
+        return scaled

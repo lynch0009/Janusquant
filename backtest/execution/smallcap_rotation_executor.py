@@ -14,7 +14,7 @@ from backtest.portfolio import PositionState, TradeRecord
 from backtest.strategies.models import DailyCandidate
 from backtest.utils.metadata import merge_metadata
 from backtest.utils.price_limits import decide_daily_buy_fill, decide_daily_sell_fill
-from backtest.utils.trading import calculate_entry_quantity, calculate_required_cash
+from backtest.execution.trading import calculate_entry_quantity, calculate_required_cash
 
 
 class SmallCapRotationDailyOpenExecutor(DailyBarExecutor):

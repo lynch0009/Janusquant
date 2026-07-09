@@ -202,28 +202,7 @@ class ResearchRunner:
 
         publication = StagedOutput(batch.output_dir)
         with publication as batch_staging:
-            grouped: dict[str, list[ResearchRequest]] = {}
-            for request in normalized:
-                builder = dataset_builder_factory(request)
-                key_payload = {
-                    "builder": f"{type(builder).__module__}.{type(builder).__qualname__}",
-                    "builder_version": builder.cache_identity,
-                    "dataset": json_ready(builder.stable_config(request.dataset)),
-                    "start": request.study.start_date.isoformat(),
-                    "end": request.study.end_date.isoformat(),
-                    "label": {
-                        "type": f"{type(self.label_builder).__module__}.{type(self.label_builder).__qualname__}",
-                        "version": self.label_builder.version,
-                    },
-                    "selectors": [_stable_component(value, strict=True) for value in request.selectors],
-                    "transformers": [_stable_component(value, strict=True) for value in request.transformers],
-                }
-                try:
-                    key = json.dumps(key_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-                except TypeError as exc:
-                    raise ResearchConfigError("batch sharing configuration must be stably JSON serializable") from exc
-                grouped.setdefault(key, []).append(request)
-
+            grouped = self._group_batch_requests(normalized, dataset_builder_factory)
             studies: list[StudyResult] = []
             group_rows = []
             for group_index, requests in enumerate(grouped.values(), 1):
@@ -239,58 +218,12 @@ class ResearchRunner:
                         output_dir=batch_staging / f"{request.study.job_index:02d}_{_slug(request.study.job_name)}",
                     )
                     studies.append(self.run(child, dataset_builder=builder, prepared_panel=shared_panel))
-            batch_summary = pd.DataFrame([
-                {"job_index": item.metadata["study"]["job_index"], "job_name": item.metadata["study"]["job_name"],
-                 "output_dir": str(publication.output_dir / item.output_dir.relative_to(batch_staging)),
-                 **item.summary}
-                for item in studies
-            ])
-            groups = pd.DataFrame(group_rows)
-            batch_summary.to_csv(batch_staging / "batch_summary.csv", index=False, encoding="utf-8-sig")
-            groups.to_csv(batch_staging / "batch_group_summary.csv", index=False, encoding="utf-8-sig")
-            metadata_path = batch_staging / "metadata.json"
-            metadata_path.write_text(
-                json.dumps(
-                    {
-                        "study_count": len(studies),
-                        "shared_group_count": len(grouped),
-                        "jobs": [
-                            {
-                                "job_index": item.metadata["study"]["job_index"],
-                                "job_name": item.metadata["study"]["job_name"],
-                                "output_dir": str(
-                                    publication.output_dir / item.output_dir.relative_to(batch_staging)
-                                ),
-                            }
-                            for item in studies
-                        ],
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            (batch_staging / "summary.json").write_text(
-                json.dumps(
-                    {
-                        "study_count": len(studies),
-                        "shared_group_count": len(grouped),
-                        "output_dir": str(publication.output_dir),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            (batch_staging / "report.md").write_text(
-                "\n".join([
-                    "# 批量研究报告",
-                    "",
-                    f"- 任务数：{len(studies)}",
-                    f"- 共享计算组数：{len(grouped)}",
-                    f"- 输出目录：{publication.output_dir}",
-                ]),
-                encoding="utf-8",
+            batch_summary, groups = self._write_batch_outputs(
+                batch_staging,
+                final_root=publication.output_dir,
+                studies=studies,
+                group_rows=group_rows,
+                shared_group_count=len(grouped),
             )
             _write_batch_manifest(batch_staging)
         final = publication.output_dir
@@ -298,6 +231,85 @@ class ResearchRunner:
             relative = item.output_dir.relative_to(batch_staging)
             item.output_dir = final / relative
         return BatchResult(final, studies, batch_summary, groups)
+
+    def _group_batch_requests(
+        self,
+        requests: list[ResearchRequest],
+        dataset_builder_factory,
+    ) -> dict[str, list[ResearchRequest]]:
+        grouped: dict[str, list[ResearchRequest]] = {}
+        for request in requests:
+            builder = dataset_builder_factory(request)
+            key = self._batch_share_key(request, builder)
+            grouped.setdefault(key, []).append(request)
+        return grouped
+
+    def _batch_share_key(self, request: ResearchRequest, builder) -> str:
+        key_payload = {
+            "builder": f"{type(builder).__module__}.{type(builder).__qualname__}",
+            "builder_version": builder.cache_identity,
+            "dataset": json_ready(builder.stable_config(request.dataset)),
+            "start": request.study.start_date.isoformat(),
+            "end": request.study.end_date.isoformat(),
+            "label": {
+                "type": f"{type(self.label_builder).__module__}.{type(self.label_builder).__qualname__}",
+                "version": self.label_builder.version,
+            },
+            "selectors": [_stable_component(value, strict=True) for value in request.selectors],
+            "transformers": [_stable_component(value, strict=True) for value in request.transformers],
+        }
+        try:
+            return json.dumps(key_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        except TypeError as exc:
+            raise ResearchConfigError("batch sharing configuration must be stably JSON serializable") from exc
+
+    @staticmethod
+    def _write_batch_outputs(
+        root: Path,
+        *,
+        final_root: Path,
+        studies: list[StudyResult],
+        group_rows: list[dict[str, Any]],
+        shared_group_count: int,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        batch_summary = pd.DataFrame([
+            {"job_index": item.metadata["study"]["job_index"], "job_name": item.metadata["study"]["job_name"],
+             "output_dir": str(final_root / item.output_dir.relative_to(root)),
+             **item.summary}
+            for item in studies
+        ])
+        groups = pd.DataFrame(group_rows)
+        batch_summary.to_csv(root / "batch_summary.csv", index=False, encoding="utf-8-sig")
+        groups.to_csv(root / "batch_group_summary.csv", index=False, encoding="utf-8-sig")
+        jobs = [
+            {
+                "job_index": item.metadata["study"]["job_index"],
+                "job_name": item.metadata["study"]["job_name"],
+                "output_dir": str(final_root / item.output_dir.relative_to(root)),
+            }
+            for item in studies
+        ]
+        (root / "metadata.json").write_text(
+            json.dumps({"study_count": len(studies), "shared_group_count": shared_group_count, "jobs": jobs},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (root / "summary.json").write_text(
+            json.dumps({"study_count": len(studies), "shared_group_count": shared_group_count,
+                        "output_dir": str(final_root)}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (root / "report.md").write_text(
+            "\n".join([
+                "# 批量研究报告",
+                "",
+                f"- 任务数：{len(studies)}",
+                f"- 共享计算组数：{shared_group_count}",
+                f"- 输出目录：{final_root}",
+            ]),
+            encoding="utf-8",
+        )
+        return batch_summary, groups
 
     def _shared_request(self, requests: list[ResearchRequest], output_dir: Path, index: int) -> ResearchRequest:
         first = requests[0]

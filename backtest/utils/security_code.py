@@ -7,7 +7,7 @@ INDEX_CODE_PREFIXES = ("sh.000", "sz.399", "bj.899")
 
 
 def normalize_internal_code(code: str) -> str:
-    """统一成 Mongo 内部格式：sh.600000 / sz.000001 / bj.920118。"""
+    """统一成项目内部代码格式：sh.600000 / sz.000001 / bj.920118。"""
 
     value = str(code or "").strip()
     if not value:

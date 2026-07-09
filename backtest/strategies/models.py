@@ -16,3 +16,14 @@ class DailyCandidate:
     score: float | None = None
     hold_days: int = 1
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class IndexSlotRebalanceIntent:
+    """普通信号模式下的指数槽位目标调整。"""
+
+    signal_date: datetime
+    code: str
+    target_market_value: float
+    reason: str
+    metadata: dict[str, Any] = field(default_factory=dict)

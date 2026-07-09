@@ -168,7 +168,7 @@ class SmallCapAmountShockReversalStrategy(SmallCapSignalTableStrategy):
         frame_cache = getattr(data_portal, "frame_cache", None)
         if frame_cache is not None:
             payload = {
-                "feature_formula_version": "smallcap_amount_shock_indicator_v2",
+                "feature_formula_version": "smallcap_amount_shock_indicator_v3",
                 "warmup_start": warmup_start,
                 "signal_end": signal_end,
                 "codes_signature": frame_cache.codes_signature(codes),
@@ -232,9 +232,44 @@ class SmallCapAmountShockReversalStrategy(SmallCapSignalTableStrategy):
         if daily_history.empty:
             return pd.DataFrame()
 
+        raw_history_fields = ["code", "trade_date", "close"]
+        if research_store is not None:
+            raw_history = research_store.load_daily_history(
+                warmup_start,
+                history_end,
+                codes=codes,
+                fields=raw_history_fields,
+                include_stopped=False,
+                price_mode="raw",
+                batch_size=1000,
+            )
+        else:
+            raw_history = data_portal.get_daily_history(
+                warmup_start,
+                history_end,
+                codes=codes,
+                fields=raw_history_fields,
+                include_stopped=False,
+                price_mode="raw",
+                batch_size=1000,
+            )
+
         daily_history = daily_history.copy()
         daily_history["trade_date"] = pd.to_datetime(daily_history["trade_date"])
         daily_history = daily_history.sort_values(["code", "trade_date"]).reset_index(drop=True)
+        if raw_history.empty:
+            daily_history["raw_close"] = daily_history["close"]
+        else:
+            raw_history = raw_history.copy()
+            raw_history["trade_date"] = pd.to_datetime(raw_history["trade_date"])
+            raw_history = raw_history.rename(columns={"close": "raw_close"})
+            daily_history = daily_history.merge(
+                raw_history[["code", "trade_date", "raw_close"]],
+                on=["code", "trade_date"],
+                how="left",
+            )
+            daily_history["raw_close"] = daily_history["raw_close"].fillna(daily_history["close"])
+        daily_history["raw_close"] = pd.to_numeric(daily_history["raw_close"], errors="coerce")
 
         grouped = daily_history.groupby("code", sort=False)
         daily_history[self.amount_fast_col] = grouped["amount"].transform(
@@ -260,6 +295,14 @@ class SmallCapAmountShockReversalStrategy(SmallCapSignalTableStrategy):
         else:
             daily_history["is_st_lookback_flag"] = False
         return daily_history
+
+    @staticmethod
+    def _ensure_raw_close_column(frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty or "raw_close" in frame.columns or "close" not in frame.columns:
+            return frame
+        result = frame.copy()
+        result["raw_close"] = result["close"]
+        return result
 
     def _assign_groups(self, frame: pd.DataFrame) -> pd.DataFrame:
         if frame.empty:
@@ -337,11 +380,12 @@ class SmallCapAmountShockReversalStrategy(SmallCapSignalTableStrategy):
         frame = candidate_pool_frame.merge(indicator_frame, on=["code", "trade_date"], how="inner")
         if frame.empty:
             return
+        frame = self._ensure_raw_close_column(frame)
         frame = frame[frame["isST"].fillna(False) == False].copy()
         if self.st_lookback_trade_days:
             frame = frame[frame["is_st_lookback_flag"].fillna(False) == False].copy()
         if self.min_signal_close_price is not None:
-            frame = frame[pd.to_numeric(frame["close"], errors="coerce") > self.min_signal_close_price].copy()
+            frame = frame[pd.to_numeric(frame["raw_close"], errors="coerce") > self.min_signal_close_price].copy()
         self.set_signal_table(self._build_signal_table(frame))
 
     @staticmethod
@@ -365,6 +409,7 @@ class SmallCapAmountShockReversalStrategy(SmallCapSignalTableStrategy):
                 self.cap_field: float(getattr(row, self.cap_field)),
                 "close": float(row.close),
             }
+            self._safe_float_metadata(metadata, "raw_close", getattr(row, "raw_close", None))
             amount_group_value = getattr(row, "amount_group", None)
             ret_group_value = getattr(row, "ret_group", None)
             if pd.notna(amount_group_value):

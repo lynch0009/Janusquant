@@ -1,9 +1,8 @@
 # Core framework
 PyYAML>=6.0
 pandas>=2.0
-pyarrow>=14.0
 numpy>=1.24
-pymongo>=4.6
+duckdb>=1.0
 SQLAlchemy>=2.0
 psycopg2-binary>=2.9
 aioredis>=2.0
@@ -21,6 +20,7 @@ streamlit>=1.30
 requests>=2.31
 baostock>=0.8.8
 akshare>=1.12
+pywencai>=0.12.3
 APScheduler>=3.10
 
 # Optional local-only dependencies

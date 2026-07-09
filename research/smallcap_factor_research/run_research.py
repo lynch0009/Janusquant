@@ -13,8 +13,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from backtest.data import MongoDataPortal
-from backtest.db import MongoDBConfig
+from backtest.data import DuckDBDataPortal
+from backtest.db import DuckDBConfig
+from backtest.utils.config_loader import parse_bool
 from research.cache import ResearchFrameCache
 from research.config import GroupFilterSpec, ResearchSpec, ValueFilterSpec
 from research.metrics import CapBucketMetric, HoldingAttributionMetric, StandardMetricSuite
@@ -71,11 +72,22 @@ def _csv_values(value: object) -> tuple[str, ...]:
 
 
 def _int_values(value: object) -> tuple[int, ...]:
-    return tuple(int(item) for item in _csv_values(value))
+    try:
+        return tuple(int(item) for item in _csv_values(value))
+    except ValueError as exc:
+        raise ValueError(f"comma-separated integer list expected, got: {value!r}") from exc
 
 
 def _optional_direction(value: object) -> int | None:
-    return None if value is None or not str(value).strip() else int(float(str(value).strip()))
+    if value is None or not str(value).strip():
+        return None
+    try:
+        numeric = float(str(value).strip())
+    except ValueError as exc:
+        raise ValueError(f"direction must be 1 or -1, got: {value!r}") from exc
+    if not numeric.is_integer() or int(numeric) not in (-1, 1):
+        raise ValueError(f"direction must be 1 or -1, got: {value!r}")
+    return int(numeric)
 
 
 def _directions(value: object) -> dict[str, int] | None:
@@ -83,15 +95,17 @@ def _directions(value: object) -> dict[str, int] | None:
         return None
     result = {}
     for item in _csv_values(value):
+        if ":" not in item:
+            raise ValueError(f"feature direction must use feature:direction format, got: {item!r}")
         name, direction = item.split(":", 1)
-        result[name.strip()] = int(float(direction))
+        normalized = name.strip().lower()
+        if not normalized:
+            raise ValueError(f"feature direction has empty feature name: {item!r}")
+        parsed = _optional_direction(direction)
+        if parsed is None:
+            raise ValueError(f"feature direction is missing direction value: {item!r}")
+        result[normalized] = parsed
     return result
-
-
-def _bool_value(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
 def _filter(args) -> ValueFilterSpec | GroupFilterSpec | None:
@@ -101,11 +115,21 @@ def _filter(args) -> ValueFilterSpec | GroupFilterSpec | None:
     if not args.filter_feature:
         raise ValueError("filter-feature 不能为空")
     if mode == "value":
+        if args.filter_value is None or not str(args.filter_value).strip():
+            raise ValueError("value filter requires --filter-value")
         return ValueFilterSpec(args.filter_feature, args.filter_operator or "==", args.filter_value)
+    if args.filter_value is None or not str(args.filter_value).strip():
+        raise ValueError("group filter requires --filter-value as target group")
+    if not int(args.filter_group_count):
+        raise ValueError("group filter requires --filter-group-count")
+    try:
+        target_group = int(float(args.filter_value))
+    except ValueError as exc:
+        raise ValueError(f"group filter target group must be numeric, got: {args.filter_value!r}") from exc
     return GroupFilterSpec(
         args.filter_feature,
         _optional_direction(args.filter_direction) or 1,
-        int(float(args.filter_value)),
+        target_group,
         args.filter_group_count,
     )
 
@@ -144,7 +168,7 @@ def build_request(
         candidate_pool_size=int(get("candidate_pool_size", args.candidate_pool_size)),
         price_mode=str(get("price_mode", args.price_mode)),
         min_listing_trade_days=int(get("min_listing_trade_days", args.min_listing_trade_days)),
-        exclude_st=not _bool_value(get("include_st", args.include_st)),
+        exclude_st=not parse_bool(get("include_st", args.include_st)),
     )
     metrics = list(StandardMetricSuite().metrics)
     metrics.append(CapBucketMetric())
@@ -193,9 +217,9 @@ def load_batch(args) -> BatchRequest:
 
 def main() -> None:
     args = parse_args()
-    db_client = MongoDBConfig()
+    db_client = DuckDBConfig()
     try:
-        portal = MongoDataPortal(db_client)
+        portal = DuckDBDataPortal(db_client)
         cache = ResearchFrameCache(None if args.disable_cache else args.cache_dir)
         runner = ResearchRunner()
 
@@ -212,7 +236,7 @@ def main() -> None:
             result = runner.run(request, dataset_builder=builder_factory(request))
         print(f"output_dir={result.output_dir}")
     finally:
-        db_client.client.close()
+        db_client.close()
 
 
 if __name__ == "__main__":

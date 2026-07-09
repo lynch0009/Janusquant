@@ -47,7 +47,26 @@ class Logger:
         return logger
 
 
-log = Logger().log()
+_configured_log: loguru.Logger | None = None
+
+
+def get_logger() -> loguru.Logger:
+    """Return the project logger, configuring file sinks on first use."""
+
+    global _configured_log
+    if _configured_log is None:
+        _configured_log = Logger().log()
+    return _configured_log
+
+
+class LazyLogger:
+    """Proxy that preserves the old ``log.info(...)`` style without import side effects."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(get_logger(), name)
+
+
+log = LazyLogger()
 
 
 def format_date(value: Any, *, fmt: str = "%Y-%m-%d", default: str = "None") -> str:
@@ -93,9 +112,9 @@ def build_log_message(event: str, **fields: Any) -> str:
 
 def log_event(level: str, event: str, **fields: Any) -> None:
     """用统一格式输出普通事件日志。"""
-    getattr(log, level)(build_log_message(event, **fields))
+    getattr(get_logger(), level)(build_log_message(event, **fields))
 
 
 def log_exception(event: str, **fields: Any) -> None:
     """用统一格式输出异常日志，并保留 traceback。"""
-    log.exception(build_log_message(event, **fields))
+    get_logger().exception(build_log_message(event, **fields))

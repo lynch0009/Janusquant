@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from hashlib import sha256
 import json
@@ -10,29 +9,12 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-import numpy as np
 import pandas as pd
+
+from backtest.utils.dataframe_cache import json_ready
 
 from .models import ResearchRequest, StudyResult
 from .output import StagedOutput
-
-
-def _jsonable(value: Any) -> Any:
-    if is_dataclass(value):
-        return {key: _jsonable(item) for key, item in asdict(value).items()}
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, pd.Timestamp):
-        return value.isoformat()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    return value
 
 
 class ResearchReporter:
@@ -72,9 +54,9 @@ class ResearchReporter:
             result.summary["cache_stats"] = result.cache_stats
 
             summary_path = staging / "summary.json"
-            summary_path.write_text(json.dumps(_jsonable(result.summary), ensure_ascii=False, indent=2), encoding="utf-8")
+            summary_path.write_text(json.dumps(json_ready(result.summary), ensure_ascii=False, indent=2), encoding="utf-8")
             metadata_path = staging / "metadata.json"
-            metadata_path.write_text(json.dumps(_jsonable(result.metadata), ensure_ascii=False, indent=2), encoding="utf-8")
+            metadata_path.write_text(json.dumps(json_ready(result.metadata), ensure_ascii=False, indent=2), encoding="utf-8")
             report_path = staging / "report.md"
             report_path.write_text(self._report(result, chart_refs), encoding="utf-8")
             for path in (summary_path, metadata_path, report_path):
@@ -94,7 +76,7 @@ class ResearchReporter:
             )
             result.summary["total_runtime_seconds"] = round(sum(result.timings.values()), 4)
             summary_path.write_text(
-                json.dumps(_jsonable(result.summary), ensure_ascii=False, indent=2), encoding="utf-8"
+                json.dumps(json_ready(result.summary), ensure_ascii=False, indent=2), encoding="utf-8"
             )
             report_path.write_text(self._report(result, chart_refs), encoding="utf-8")
             # Refresh entries changed by the final timing update.

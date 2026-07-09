@@ -18,7 +18,7 @@ from backtest.strategies import DailyCandidate
 from backtest.utils.datetime_utils import combine_trade_date, to_pydatetime
 from backtest.utils.frame_utils import first_sorted_row
 from backtest.utils.metadata import copy_metadata, merge_metadata
-from backtest.utils.trading import calculate_entry_quantity, calculate_required_cash
+from backtest.execution.trading import calculate_entry_quantity, calculate_required_cash
 
 
 def build_exit_trade_from_price(

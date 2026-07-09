@@ -11,8 +11,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from backtest.data import MongoDataPortal
-from backtest.db import MongoDBConfig
+from backtest.data import DuckDBDataPortal
+from backtest.db import DuckDBConfig
 from backtest.execution import EngineConfig, SignalDrivenBacktestEngine
 from backtest.execution.smallcap_rotation_executor import SmallCapRotationDailyOpenExecutor
 from backtest.portfolio import EqualSlotSizer
@@ -27,7 +27,18 @@ from backtest.strategies import MinerviniAshareStrategy
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "minervini_ashare_backtest"
 
-
+'''
+python backtest\runs\run_minervini_ashare_backtest.py `
+  --start-date 2025-01-01 `
+  --end-date 2026-04-04 `
+  --initial-cash 1000000 `
+  --top-k 5 `
+  --max-positions 5 `
+  --hold-days 20 `
+  --rebalance-every 10 `
+  --price-mode hfq `
+  --slippage-bps 10
+'''
 def build_run_output_dir(base_dir: Path, start_date: datetime, end_date: datetime) -> Path:
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"{start_date:%Y%m%d}_{end_date:%Y%m%d}_{run_timestamp}"
@@ -49,10 +60,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-liqa-mv", type=float, default=None)
     parser.add_argument("--min-revenue-yoy", type=float, default=0.05)
     parser.add_argument("--min-net-profit-yoy", type=float, default=0.10)
-    parser.add_argument("--min-roe", type=float, default=0.08)
-    parser.add_argument("--min-cfo-to-np", type=float, default=None)
-    parser.add_argument("--min-revenue-acceleration", type=float, default=None)
-    parser.add_argument("--min-net-profit-acceleration", type=float, default=None)
     parser.add_argument("--min-rps", type=float, default=85.0)
     parser.add_argument("--min-close-to-high-250", type=float, default=0.75)
     parser.add_argument("--min-above-low-250", type=float, default=1.25)
@@ -86,8 +93,8 @@ def main() -> None:
     start_date = datetime.strptime(args.start_date, "%Y-%m-%d")
     requested_end_date = datetime.strptime(args.end_date, "%Y-%m-%d")
 
-    db_client = MongoDBConfig()
-    data_portal = MongoDataPortal(db_client)
+    db_client = DuckDBConfig()
+    data_portal = DuckDBDataPortal(db_client)
     trade_dates = data_portal.get_trade_calendar(start_date, requested_end_date)
     if not trade_dates:
         raise ValueError("No trade dates available in the requested date range.")
@@ -110,10 +117,6 @@ def main() -> None:
         max_liqa_mv=args.max_liqa_mv,
         min_revenue_yoy=args.min_revenue_yoy,
         min_net_profit_yoy=args.min_net_profit_yoy,
-        min_roe=args.min_roe,
-        min_cfo_to_np=args.min_cfo_to_np,
-        min_revenue_acceleration=args.min_revenue_acceleration,
-        min_net_profit_acceleration=args.min_net_profit_acceleration,
         min_rps=args.min_rps,
         min_close_to_high_250=args.min_close_to_high_250,
         min_above_low_250=args.min_above_low_250,
