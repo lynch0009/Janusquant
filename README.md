@@ -10,16 +10,16 @@ Janusquant 关注的不是“把历史信号按收盘价成交”这一类理想
 
 - **面向 A 股交易规则**：回测链路可处理涨跌停、停牌、ST、流动性过滤、交易成本和滑点等约束，减少理想化成交。
 - **统一数据与价格口径**：支持原始价格、前复权和后复权研究口径，并将行情、特征、财务、复权因子和分红数据纳入同一研究流程。
-- **覆盖完整研究链路**：提供数据抓取、横截面因子研究、策略回测、参数批跑、组合记账、风险退出和报告导出。
+- **覆盖完整研究链路**：提供数据抓取、特征构建、策略回测、参数批跑、组合记账、风险退出和报告导出。
 - **结果可追溯**：输出订单、成交、持仓、权益曲线、基准对比、绩效指标和图表，便于定位信号、执行或记账问题。
 - **适合扩展**：数据访问、策略、执行、组合、风控和分析分层组织，可替换或新增组件，而不必重写整条回测链路。
 
 ## 核心能力
 
 - DuckDB 数据访问：日线、特征、财务、复权因子、分红事件和研究面板。
-- 策略实现：小市值轮动、流动性过滤、成交额冲击、regime 过滤、Minervini A 股选股等。
+- 策略实现：小市值轮动、流动性过滤、成交额冲击、反转策略、Minervini A 股选股等。
 - 回测执行：信号驱动引擎、执行模型、组合记账、仓位管理和退出规则。
-- 研究流程：因子分组、周度 regime 实验、指标计算和报告导出。
+- 数据工具：面向 DuckDB 表的数据抓取、清洗、标准化和增量写入。
 
 ## 快速开始
 
@@ -59,8 +59,7 @@ backtest/portfolio/   订单、持仓、组合记账和结果对象
 backtest/risk/        退出策略和风控规则
 backtest/runs/        回测入口和数据维护脚本
 backtest/utils/       通用工具函数
-research/             研究框架和小市值实验
-trading/              轻量交易意图模型
+research/             研究框架
 config/               本地配置示例
 ```
 
@@ -78,7 +77,6 @@ python backtest/runs/run_smallcap_liquidity_backtest.py --start-date 2025-01-01 
 - `backtest/runs/run_smallcap_liquidity_batch.py`
 - `backtest/runs/run_smallcap_amount_shock_event_backtest.py`
 - `backtest/runs/run_minervini_ashare_backtest.py`
-- `research/smallcap_factor_research/run_research.py`
 
 运行结果会输出到 `backtest/runs/output/` 或研究脚本对应的输出目录。
 
