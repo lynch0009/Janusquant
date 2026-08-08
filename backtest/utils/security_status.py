@@ -49,10 +49,12 @@ def is_st_name(name: Any) -> bool:
 def is_delisted_basic_doc(doc: dict[str, Any], today: datetime) -> bool:
     """按 basic_info 字段判断股票是否已经退市或不再 active。"""
 
+    out_date = parse_basic_date(doc.get("outDate"))
+    today_date = parse_basic_date(today)
+    if out_date is not None and today_date is not None:
+        return out_date < today_date
     if doc.get("status") is False:
         return True
     if str(doc.get("listing_status") or "").strip().lower() == "delisted":
         return True
-    out_date = parse_basic_date(doc.get("outDate"))
-    today_date = parse_basic_date(today)
-    return out_date is not None and today_date is not None and out_date <= today_date
+    return False

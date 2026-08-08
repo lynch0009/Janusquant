@@ -4,7 +4,12 @@ from datetime import datetime
 from typing import Any, Sequence
 
 from backtest.db import DuckDBConfig
-from backtest.db.duckdb_write import upsert_frame
+from backtest.fetch_data.adjust_factor_baseline import (
+    AdjustmentFactorBaselineWriteSummary,
+    build_adjustment_factor_baseline,
+    write_missing_adjustment_factor_baselines,
+)
+from backtest.fetch_data.core.writer import upsert_records
 from backtest.utils import (
     is_delisted_basic_doc,
     is_hs_a_share_code,
@@ -21,14 +26,16 @@ from .models import BasicInfoSyncResult, StockMeta
 from .xt_details import fetch_xt_detail_map
 
 
-def infer_exchange(xt_code: str, detail: dict[str, Any] | None = None) -> str:
-    if "." in str(xt_code):
-        return str(xt_code).split(".", 1)[1].lower()
-    if detail:
-        exchange = str(detail.get("ExchangeID") or detail.get("ExchangeCode") or "").strip().lower()
-        if exchange in {"sh", "sz", "bj"}:
-            return exchange
-    return ""
+def _parse_xt_expire_date(value: Any) -> datetime | None:
+    """Normalize QMT's no-expiry sentinel dates to a missing out-date."""
+
+    parsed = parse_basic_date(value)
+    # QMT may return values such as ``10001011`` for an active security with
+    # no expiry date.  They parse as year 1000, but are not valid delisting
+    # dates and cannot be represented by pandas' datetime64[ns].
+    if parsed is not None and parsed.year < 1900:
+        return None
+    return parsed
 
 
 def infer_market_from_code(code: str) -> str:
@@ -47,9 +54,10 @@ def build_basic_info_doc(xt_code: str, detail: dict[str, Any], now: datetime | N
     now = now or datetime.now()
     code = normalize_internal_code(xt_code)
     ipo_date = parse_basic_date(detail.get("OpenDate") or detail.get("CreateDate"))
-    out_date = parse_basic_date(detail.get("ExpireDate"))
+    out_date = _parse_xt_expire_date(detail.get("ExpireDate"))
     # IsTrading 表示当前是否可交易，实测正常上市股票也可能为 False，不能用来判断上市状态。
-    status = out_date is None or out_date > now
+    today = parse_basic_date(now)
+    status = out_date is None or today is None or out_date >= today
 
     doc = {
         "code": code,
@@ -68,10 +76,6 @@ def build_basic_info_doc(xt_code: str, detail: dict[str, Any], now: datetime | N
     if out_date is not None:
         doc["outDate"] = out_date
     return doc
-
-
-def build_basic_info_operations(docs: Sequence[dict[str, Any]], now: datetime | None = None) -> list[dict[str, Any]]:
-    return list(docs)
 
 
 def stock_meta_from_basic_doc(doc: dict[str, Any], detail: dict[str, Any] | None = None) -> StockMeta:
@@ -106,21 +110,75 @@ def collect_xt_hs_stock_codes(xtdata_client) -> list[str]:
     return xt_codes
 
 
-def fetch_xt_basic_docs(xtdata_client, xt_codes: Sequence[str], now: datetime | None = None) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[str]]:
-    docs: list[dict[str, Any]] = []
-    details_by_code: dict[str, dict[str, Any]] = {}
-    failed_codes: list[str] = []
-    details_by_xt_code = fetch_xt_detail_map(xtdata_client, xt_codes)
-    for xt_code in xt_codes:
-        detail = details_by_xt_code.get(xt_code, {})
-        if not detail:
-            log_event("warning", "empty_instrument_detail", xt_code=xt_code)
-            failed_codes.append(normalize_internal_code(xt_code))
-            continue
-        doc = build_basic_info_doc(xt_code, detail, now=now)
-        docs.append(doc)
-        details_by_code[doc["code"]] = detail
-    return docs, details_by_code, failed_codes
+def update_confirmed_delistings(
+    cfg: DuckDBConfig,
+    updates: Sequence[dict[str, Any]],
+    *,
+    dry_run: bool,
+) -> int:
+    if dry_run or not updates:
+        return 0
+    cfg.execute("begin transaction")
+    try:
+        for update in updates:
+            cfg.execute(
+                f"""
+                update "{BASIC_INFO_COLLECTION}"
+                set code_name = case
+                        when ? is null or trim(?) = '' then code_name
+                        else ?
+                    end,
+                    outDate = ?,
+                    status = false,
+                    listing_status = 'delisted',
+                    outDate_source_field = 'ExpireDate',
+                    xt_code = ?,
+                    updated_at = ?
+                where code = ?
+                """,
+                [
+                    update.get("code_name"),
+                    update.get("code_name"),
+                    update.get("code_name"),
+                    update["outDate"],
+                    update["xt_code"],
+                    update["updated_at"],
+                    update["code"],
+                ],
+            )
+        cfg.execute("commit")
+    except Exception:
+        cfg.execute("rollback")
+        raise
+    return len(updates)
+
+
+def project_basic_docs(
+    basic_docs: Sequence[dict[str, Any]],
+    sync_result: BasicInfoSyncResult,
+) -> list[dict[str, Any]]:
+    """Apply the current basic-info changes in memory, including dry-run."""
+
+    by_code = {
+        normalize_internal_code(str(doc["code"])): dict(doc)
+        for doc in basic_docs
+        if str(doc.get("code", "")).strip()
+    }
+    for doc in sync_result.inserted_docs:
+        by_code[doc["code"]] = dict(doc)
+    for update in sync_result.confirmed_delisted_updates:
+        current = dict(by_code.get(update["code"], {"code": update["code"]}))
+        if str(update.get("code_name") or "").strip():
+            current["code_name"] = str(update["code_name"]).strip()
+        current.update(
+            {
+                "outDate": update["outDate"],
+                "status": False,
+                "listing_status": "delisted",
+            }
+        )
+        by_code[update["code"]] = current
+    return [by_code[code] for code in sorted(by_code)]
 
 
 def load_basic_docs(cfg: DuckDBConfig, *, hs_only: bool = False) -> list[dict[str, Any]]:
@@ -185,18 +243,81 @@ def sync_incremental_basic_info(
     xtdata_client,
     *,
     now: datetime,
-    batch_size: int,
+    dry_run: bool = False,
+    initialize_adjust_factor_baselines: bool = False,
 ) -> BasicInfoSyncResult:
     xt_codes = collect_xt_hs_stock_codes(xtdata_client)
     basic_docs = load_basic_docs(cfg, hs_only=True)
     diff_rows = build_stock_pool_diff_rows(xt_codes, basic_docs, today=now)
     new_xt_codes = [row["xt_code"] for row in diff_rows if row["diff_type"] == "xt_only"]
-    if not new_xt_codes:
-        return BasicInfoSyncResult((), (), tuple(diff_rows), {"matched": 0, "modified": 0, "upserted": 0})
+    db_only_rows = [row for row in diff_rows if row["diff_type"] == "db_only"]
+    basic_detail_xt_codes = sorted(
+        set(new_xt_codes) | {str(row["xt_code"]) for row in db_only_rows}
+    )
+    requested_xt_codes = sorted(set(xt_codes) | {str(row["xt_code"]) for row in db_only_rows})
+    details_by_xt_code = fetch_xt_detail_map(xtdata_client, requested_xt_codes)
 
-    new_docs, _details_by_code, failed_codes = fetch_xt_basic_docs(xtdata_client, new_xt_codes, now=now)
+    new_docs: list[dict[str, Any]] = []
+    failed_codes: list[str] = []
+    for xt_code in new_xt_codes:
+        detail = details_by_xt_code.get(xt_code, {})
+        if not detail:
+            code = normalize_internal_code(xt_code)
+            log_event("warning", "empty_instrument_detail", xt_code=xt_code)
+            failed_codes.append(code)
+            continue
+        new_docs.append(build_basic_info_doc(xt_code, detail, now=now))
+
+    confirmed_delisted_updates: list[dict[str, Any]] = []
+    db_only_confirmed_delisted_codes: list[str] = []
+    db_only_active_detail_codes: list[str] = []
+    db_only_detail_missing_codes: list[str] = []
+    for row in db_only_rows:
+        code = normalize_internal_code(str(row["code"]))
+        xt_code = str(row["xt_code"])
+        detail = details_by_xt_code.get(xt_code, {})
+        if not detail:
+            db_only_detail_missing_codes.append(code)
+            continue
+        expire_date = _parse_xt_expire_date(detail.get("ExpireDate"))
+        today = parse_basic_date(now)
+        if expire_date is not None and today is not None and expire_date < today:
+            confirmed_delisted_updates.append(
+                {
+                    "code": code,
+                    "code_name": str(
+                        detail.get("InstrumentName") or detail.get("ProductName") or ""
+                    ).strip(),
+                    "outDate": expire_date,
+                    "xt_code": xt_code,
+                    "updated_at": now,
+                }
+            )
+            db_only_confirmed_delisted_codes.append(code)
+        else:
+            db_only_active_detail_codes.append(code)
+
+    valid_new_docs = list(new_docs)
+    missing_ipo_codes: list[str] = []
+    baseline_docs: list[dict[str, Any]] = []
+    if initialize_adjust_factor_baselines:
+        valid_new_docs = []
+        for doc in new_docs:
+            ipo_date = parse_basic_date(doc.get("ipoDate"))
+            if ipo_date is None:
+                missing_ipo_codes.append(doc["code"])
+                continue
+            normalized = dict(doc)
+            normalized["ipoDate"] = ipo_date
+            valid_new_docs.append(normalized)
+            baseline_docs.append(build_adjustment_factor_baseline(normalized["code"], ipo_date))
+
     names_by_code = {doc["code"]: doc.get("code_name", "") for doc in new_docs}
     failed_set = set(failed_codes)
+    missing_ipo_set = set(missing_ipo_codes)
+    confirmed_delisted_set = set(db_only_confirmed_delisted_codes)
+    active_detail_set = set(db_only_active_detail_codes)
+    missing_detail_set = set(db_only_detail_missing_codes)
     enriched_rows: list[dict[str, Any]] = []
     for row in diff_rows:
         enriched = dict(row)
@@ -204,17 +325,58 @@ def sync_incremental_basic_info(
             enriched["code_name"] = names_by_code.get(row["code"], "")
             if row["code"] in failed_set:
                 enriched["reason"] = "xtquant_detail_missing"
+            elif row["code"] in missing_ipo_set:
+                enriched["reason"] = "xtquant_ipo_date_missing"
+        elif row["code"] in confirmed_delisted_set:
+            enriched["reason"] = "xtquant_expire_date_confirmed_delisted"
+        elif row["code"] in active_detail_set:
+            enriched["reason"] = "xtquant_detail_active_sector_missing"
+        elif row["code"] in missing_detail_set:
+            enriched["reason"] = "xtquant_detail_missing_preserved"
         enriched_rows.append(enriched)
 
-    write_summary = upsert_frame(
+    baseline_summary = AdjustmentFactorBaselineWriteSummary()
+    if initialize_adjust_factor_baselines:
+        baseline_summary = write_missing_adjustment_factor_baselines(
+            cfg,
+            baseline_docs,
+            dry_run=dry_run,
+        )
+    if dry_run:
+        rows_written = 0
+    else:
+        rows_written = upsert_records(
+            cfg,
+            BASIC_INFO_COLLECTION,
+            valid_new_docs,
+            key_columns=("code",),
+            dry_run=False,
+        )
+    modified_rows = update_confirmed_delistings(
         cfg,
-        BASIC_INFO_COLLECTION,
-        build_basic_info_operations(new_docs, now=now),
-        key_columns=("code",),
+        confirmed_delisted_updates,
+        dry_run=dry_run,
     )
     return BasicInfoSyncResult(
-        tuple(new_docs),
+        tuple(valid_new_docs),
         tuple(failed_codes),
         tuple(enriched_rows),
-        {"matched": 0, "modified": 0, "upserted": int(write_summary.rows_written)},
+        {
+            "matched": len(confirmed_delisted_updates),
+            "modified": modified_rows,
+            "upserted": rows_written,
+        },
+        missing_ipo_codes=tuple(sorted(missing_ipo_codes)),
+        adjust_factor_baseline_planned_count=baseline_summary.planned_count,
+        adjust_factor_baseline_existing_count=baseline_summary.existing_count,
+        adjust_factor_baseline_written_count=baseline_summary.written_count,
+        detail_requested_codes=tuple(
+            sorted(normalize_internal_code(code) for code in basic_detail_xt_codes)
+        ),
+        instrument_detail_requested_count=len(requested_xt_codes),
+        db_only_confirmed_delisted_codes=tuple(sorted(db_only_confirmed_delisted_codes)),
+        db_only_active_detail_codes=tuple(sorted(db_only_active_detail_codes)),
+        db_only_detail_missing_codes=tuple(sorted(db_only_detail_missing_codes)),
+        confirmed_delisted_updates=tuple(confirmed_delisted_updates),
+        details_by_xt_code=details_by_xt_code,
     )

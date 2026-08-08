@@ -54,6 +54,7 @@ def fallback_missing_dates_with_baostock(
     batch_size: int = 2000,
     max_missing_stocks: int = DEFAULT_MAX_FALLBACK_MISSING_STOCKS,
     max_missing_days: int = DEFAULT_MAX_FALLBACK_MISSING_DAYS,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     docs_to_write: list[dict[str, Any]] = []
     total_missing_stocks = len(missing_by_code)
@@ -63,6 +64,7 @@ def fallback_missing_dates_with_baostock(
         "unresolved_days": 0,
         "normal_suspend_days": 0,
         "skipped_by_threshold": 0,
+        "write_batches": 0,
         "resolved_dates_by_code": {},
         "unresolved_dates_by_code": {},
     }
@@ -123,7 +125,9 @@ def fallback_missing_dates_with_baostock(
                     suspend_days_in_range += 1
                     summary["normal_suspend_days"] += 1
                 if len(docs_to_write) >= batch_size:
-                    write_day_kline_docs(cfg, DAY_COLLECTION, docs_to_write)
+                    if not dry_run:
+                        write_day_kline_docs(cfg, DAY_COLLECTION, docs_to_write)
+                        summary["write_batches"] += 1
                     docs_to_write.clear()
 
             if fallback_docs_in_range:
@@ -158,7 +162,9 @@ def fallback_missing_dates_with_baostock(
                 )
 
     if docs_to_write:
-        write_day_kline_docs(cfg, DAY_COLLECTION, docs_to_write)
+        if not dry_run:
+            write_day_kline_docs(cfg, DAY_COLLECTION, docs_to_write)
+            summary["write_batches"] += 1
     for key in ("resolved_dates_by_code", "unresolved_dates_by_code"):
         summary[key] = {
             code: sorted(set(dates))

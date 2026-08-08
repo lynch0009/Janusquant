@@ -14,25 +14,18 @@ def fetch_xt_detail_map(xtdata_client: Any, xt_codes: Sequence[str]) -> dict[str
     if not requested_codes:
         return {}
 
-    if hasattr(xtdata_client, "get_instrument_detail_list"):
-        try:
-            details = xtdata_client.get_instrument_detail_list(requested_codes, True)
-        except Exception:
-            details = None
-        if isinstance(details, dict) and details:
-            return {str(code): detail for code, detail in details.items() if isinstance(detail, dict)}
-
-    details_by_xt_code: dict[str, dict[str, Any]] = {}
-    for xt_code in requested_codes:
-        try:
-            detail = xtdata_client.get_instrument_detail(xt_code, iscomplete=True) or {}
-        except TypeError:
-            detail = xtdata_client.get_instrument_detail(xt_code) or {}
-        except Exception:
-            detail = {}
-        if isinstance(detail, dict) and detail:
-            details_by_xt_code[xt_code] = detail
-    return details_by_xt_code
+    if not hasattr(xtdata_client, "get_instrument_detail_list"):
+        raise RuntimeError("xtquant client does not provide get_instrument_detail_list")
+    try:
+        details = xtdata_client.get_instrument_detail_list(requested_codes, True)
+    except Exception as exc:
+        raise RuntimeError(f"failed to fetch xtquant instrument detail list: {exc}") from exc
+    if not isinstance(details, dict):
+        raise RuntimeError(
+            "failed to fetch xtquant instrument detail list: "
+            f"expected dict, got {type(details).__name__}"
+        )
+    return {str(code): detail for code, detail in details.items() if isinstance(detail, dict)}
 
 
 def enrich_stock_metas_with_xt_details(

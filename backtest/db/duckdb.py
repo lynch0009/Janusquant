@@ -91,7 +91,7 @@ class DuckDBSettings:
 
 
 class DuckDBConfig:
-    """Small local DuckDB connection wrapper used by read-only benchmark paths."""
+    """Small local DuckDB connection wrapper for research and data jobs."""
 
     def __init__(
         self,
@@ -129,6 +129,21 @@ class DuckDBConfig:
 
     def close(self) -> None:
         self.connection.close()
+
+    @property
+    def cache_revision(self) -> str:
+        """Return a cheap file revision token for external read caches.
+
+        Parquet caches live outside DuckDB, so their keys must include the
+        database file revision. A later read-only process then cannot silently
+        reuse frames produced before the latest ingest or feature build.
+        """
+
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return f"{self.path.resolve()}:missing"
+        return f"{self.path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
 
     @contextmanager
     def registered_frame(self, name: str, frame: pd.DataFrame):

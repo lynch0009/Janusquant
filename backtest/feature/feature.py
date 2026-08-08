@@ -1,9 +1,17 @@
+import argparse
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from backtest.db import DuckDBConfig, upsert_frame
+from backtest.db.duckdb_managed_writer import append_build_frame, create_build_table, managed_upsert, publish_full_build
 from backtest.db.duckdb_write import quote_identifier, table_exists
 from backtest.utils import normalize_internal_code
 from backtest.utils.log import format_date, log_event
@@ -18,30 +26,12 @@ DUCKDB_DAY_KLINE_TABLE = "A_stock_market_day_kline"
 DUCKDB_FEATURE_TABLE = "A_stock_market_feature"
 DUCKDB_FINANCE_TABLE = "A_stock_market_finance_data"
 DUCKDB_ADJUST_FACTOR_TABLE = "A_stock_market_adjust_factor"
+DUCKDB_DIVIDEND_TABLE = "A_stock_market_dividend_data"
 
 
 def _is_supported_a_share_code(code: str) -> bool:
     normalized = normalize_internal_code(code)
     return normalized.startswith(A_SHARE_PREFIXES)
-
-
-def _normalize_datetime_column(series: pd.Series, *, normalize: bool) -> pd.Series:
-    converted = pd.to_datetime(series, errors="coerce")
-    if normalize:
-        converted = converted.dt.normalize()
-    return pd.Series(
-        [None if pd.isna(value) else value.to_pydatetime() for value in converted],
-        index=series.index,
-        dtype=object,
-    )
-
-
-def feature_frame_to_records(df: pd.DataFrame) -> list[dict]:
-    normalized = df.copy()
-    for column in ("date", "pubDate", "statDate", "financePubDate"):
-        if column in normalized.columns:
-            normalized[column] = _normalize_datetime_column(normalized[column], normalize=True)
-    return normalized.to_dict("records")
 
 
 def dedupe_feature_docs_by_key(docs: list[dict]) -> tuple[list[dict], int]:
@@ -297,6 +287,7 @@ class DuckDBFeature:
         end_date: datetime,
         day_kline_df: pd.DataFrame,
         finance_df: pd.DataFrame | None,
+        dividend_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         if day_kline_df.empty:
             log_event(
@@ -364,6 +355,8 @@ class DuckDBFeature:
         if df_merged.empty:
             return pd.DataFrame()
 
+        df_merged = self._apply_effective_share_counts(df_merged, dividend_df)
+
         df_merged.loc[:, "totalMV"] = pd.to_numeric(df_merged["prec"], errors="coerce") * df_merged["totalShare"]
         df_merged.loc[:, "liqaMV"] = pd.to_numeric(df_merged["prec"], errors="coerce") * df_merged["liqaShare"]
         df_merged.loc[:, "financePubDate"] = df_merged["pubDate"]
@@ -384,6 +377,61 @@ class DuckDBFeature:
         )
         return df_merged
 
+    @staticmethod
+    def _apply_effective_share_counts(frame: pd.DataFrame, dividend_df: pd.DataFrame | None) -> pd.DataFrame:
+        """Apply post-report stock dividends before calculating market value.
+
+        Finance reports contain an as-of share count. A later stock dividend or
+        reserve-to-stock action changes shares immediately on its operate date,
+        while the next report may not arrive for months. Cumulative action
+        factors are divided by the factor already reflected at the report's
+        statDate, preventing an action from being applied twice after a newer
+        finance report becomes visible.
+        """
+
+        if frame.empty or dividend_df is None or dividend_df.empty:
+            return frame
+
+        actions = dividend_df.copy()
+        actions["dividOperateDate"] = pd.to_datetime(actions["dividOperateDate"], errors="coerce")
+        actions["dividStocksPs"] = pd.to_numeric(actions["dividStocksPs"], errors="coerce").fillna(0.0)
+        actions["dividReserveToStockPs"] = pd.to_numeric(actions["dividReserveToStockPs"], errors="coerce").fillna(0.0)
+        actions["share_ratio"] = actions["dividStocksPs"] + actions["dividReserveToStockPs"]
+        actions = actions[(actions["dividOperateDate"].notna()) & (actions["share_ratio"] > 0)].copy()
+        if actions.empty:
+            return frame
+        actions = actions.drop_duplicates(
+            subset=["dividOperateDate", "dividStocksPs", "dividReserveToStockPs"], keep="last"
+        ).sort_values("dividOperateDate", kind="mergesort")
+        actions["share_factor"] = (1.0 + actions["share_ratio"]).cumprod()
+
+        result = frame.copy()
+        result["date"] = pd.to_datetime(result["date"], errors="coerce")
+        result["statDate"] = pd.to_datetime(result["statDate"], errors="coerce")
+        indexed = result.reset_index(names="_row_index")
+        action_values = actions[["dividOperateDate", "share_factor"]]
+        date_factor = pd.merge_asof(
+            indexed[["_row_index", "date"]].sort_values("date", kind="mergesort"),
+            action_values,
+            left_on="date",
+            right_on="dividOperateDate",
+            direction="backward",
+        )[["_row_index", "share_factor"]].rename(columns={"share_factor": "_share_factor_at_date"})
+        stat_factor = pd.merge_asof(
+            indexed[["_row_index", "statDate"]].dropna().sort_values("statDate", kind="mergesort"),
+            action_values,
+            left_on="statDate",
+            right_on="dividOperateDate",
+            direction="backward",
+        )[["_row_index", "share_factor"]].rename(columns={"share_factor": "_share_factor_at_stat"})
+        result = result.reset_index(names="_row_index").merge(date_factor, on="_row_index", how="left").merge(
+            stat_factor, on="_row_index", how="left"
+        )
+        ratio = result["_share_factor_at_date"].fillna(1.0) / result["_share_factor_at_stat"].fillna(1.0)
+        result["totalShare"] = pd.to_numeric(result["totalShare"], errors="coerce") * ratio
+        result["liqaShare"] = pd.to_numeric(result["liqaShare"], errors="coerce") * ratio
+        return result.drop(columns=["_row_index", "_share_factor_at_date", "_share_factor_at_stat"], errors="ignore")
+
     def _build_feature_frames_batch(self, plan_items: list[dict[str, Any]]) -> list[pd.DataFrame]:
         if not plan_items:
             return []
@@ -400,18 +448,46 @@ class DuckDBFeature:
             """,
             [*codes, min_start_date, max_end_date],
         )
+        # 每只股票保留区间开始日前最后一份财报，确保 merge_asof 的可见财报不变。
         finance_frame = self._fetch_df(
             f"""
+            with finance_before_start as (
+                select code, pubDate, statDate, totalShare, liqaShare
+                from {DUCKDB_FINANCE_TABLE}
+                where code in ({placeholders}) and pubDate < ?
+                qualify row_number() over (partition by code order by pubDate desc, statDate desc) = 1
+            ), finance_in_range as (
+                select code, pubDate, statDate, totalShare, liqaShare
+                from {DUCKDB_FINANCE_TABLE}
+                where code in ({placeholders}) and pubDate >= ? and pubDate <= ?
+            )
             select code, pubDate, statDate, totalShare, liqaShare
-            from {DUCKDB_FINANCE_TABLE}
-            where code in ({placeholders}) and pubDate >= ? and pubDate <= ?
+            from finance_before_start
+            union all
+            select code, pubDate, statDate, totalShare, liqaShare
+            from finance_in_range
             order by code, pubDate, statDate
             """,
-            [*codes, FEATURE_START_DATE, max_end_date],
+            [*codes, min_start_date, *codes, min_start_date, max_end_date],
         )
+        dividend_start_date = FEATURE_START_DATE
+        if not finance_frame.empty and "statDate" in finance_frame.columns:
+            earliest_stat_date = pd.to_datetime(finance_frame["statDate"], errors="coerce").min()
+            if pd.notna(earliest_stat_date):
+                dividend_start_date = max(FEATURE_START_DATE, earliest_stat_date.to_pydatetime())
+        dividend_frame = self._fetch_df(
+            f"""
+            select code, dividOperateDate, dividStocksPs, dividReserveToStockPs
+            from {DUCKDB_DIVIDEND_TABLE}
+            where code in ({placeholders}) and dividOperateDate >= ? and dividOperateDate <= ?
+            order by code, dividOperateDate
+            """,
+            [*codes, dividend_start_date, max_end_date],
+        ) if table_exists(self.db_client, DUCKDB_DIVIDEND_TABLE) else pd.DataFrame()
 
         day_by_code = {code: group.copy() for code, group in day_frame.groupby("code")} if not day_frame.empty else {}
         finance_by_code = {code: group.copy() for code, group in finance_frame.groupby("code")} if not finance_frame.empty else {}
+        dividend_by_code = {code: group.copy() for code, group in dividend_frame.groupby("code")} if not dividend_frame.empty else {}
         frames: list[pd.DataFrame] = []
         for item in plan_items:
             code = item["code"]
@@ -425,12 +501,14 @@ class DuckDBFeature:
             if not source_finance.empty:
                 source_finance["pubDate"] = pd.to_datetime(source_finance["pubDate"], errors="coerce")
                 source_finance = source_finance[source_finance["pubDate"] <= end_date].copy()
+            source_dividend = dividend_by_code.get(code, pd.DataFrame()).copy()
             feature_frame = self._build_feature_frame_from_sources(
                 code,
                 start_date,
                 end_date,
                 source_day,
                 source_finance,
+                source_dividend,
             )
             if not feature_frame.empty:
                 frames.append(feature_frame)
@@ -439,14 +517,14 @@ class DuckDBFeature:
     def save_feature_daily(self, df, collection: str = DUCKDB_FEATURE_TABLE):
         if df is None or df.empty:
             return 0
-        docs = feature_frame_to_records(df)
-        docs, duplicate_count = dedupe_feature_docs_by_key(docs)
-        frame = pd.DataFrame(docs)
+        frame = df.copy()
         if frame.empty:
             return 0
         for column in ("date", "financePubDate"):
             if column in frame.columns:
                 frame[column] = pd.to_datetime(frame[column], errors="coerce")
+        duplicate_count = int(frame.duplicated(subset=["code", "date"], keep="last").sum())
+        frame = frame.drop_duplicates(subset=["code", "date"], keep="last").reset_index(drop=True)
         if duplicate_count:
             log_event(
                 "warning",
@@ -455,8 +533,12 @@ class DuckDBFeature:
                 duplicate_rows=duplicate_count,
                 remaining_rows=len(frame),
             )
-        upsert_frame(self.db_client, collection or DUCKDB_FEATURE_TABLE, frame, key_columns=("code", "date"))
-        if (collection or DUCKDB_FEATURE_TABLE) == DUCKDB_FEATURE_TABLE and not self._feature_index_ensured:
+        target_collection = collection or DUCKDB_FEATURE_TABLE
+        if target_collection == DUCKDB_FEATURE_TABLE:
+            managed_upsert(self.db_client, target_collection, frame)
+        else:
+            upsert_frame(self.db_client, target_collection, frame, key_columns=("code", "date"))
+        if target_collection == DUCKDB_FEATURE_TABLE and not self._feature_index_ensured:
             self.ensure_indexes()
         log_event("info", "feature write finished", backend="duckdb", collection=collection, written_rows=len(frame))
         return len(frame)
@@ -477,6 +559,8 @@ class DuckDBFeature:
         updated_rows = 0
         pending_frames: list[pd.DataFrame] = []
         pending_rows = 0
+        full_rebuild = force_full_refresh and codes is None
+        build_table = create_build_table(self.db_client, DUCKDB_FEATURE_TABLE) if full_rebuild else None
 
         def flush_pending_frames() -> int:
             nonlocal pending_frames, pending_rows
@@ -484,37 +568,51 @@ class DuckDBFeature:
                 return 0
             merged = pd.concat(pending_frames, ignore_index=True)
             log_event("info", "feature flush start", backend="duckdb", frame_count=len(pending_frames), rows=len(merged))
-            written = self.save_feature_daily(merged, collection=DUCKDB_FEATURE_TABLE)
+            if build_table is not None:
+                written = append_build_frame(self.db_client, DUCKDB_FEATURE_TABLE, build_table, merged)
+            else:
+                written = self.save_feature_daily(merged, collection=DUCKDB_FEATURE_TABLE)
             pending_frames = []
             pending_rows = 0
             log_event("info", "feature flush done", backend="duckdb", written_rows=written)
             return written
 
-        for batch_start in range(0, len(sync_plan), FEATURE_READ_CODE_BATCH_SIZE):
-            batch_items = sync_plan[batch_start : batch_start + FEATURE_READ_CODE_BATCH_SIZE]
-            log_event(
-                "info",
-                "feature sync batch start",
-                backend="duckdb",
-                batch=f"{batch_start // FEATURE_READ_CODE_BATCH_SIZE + 1}/{(len(sync_plan) + FEATURE_READ_CODE_BATCH_SIZE - 1) // FEATURE_READ_CODE_BATCH_SIZE}",
-                codes=len(batch_items),
-            )
-            batch_frames = self._build_feature_frames_batch(batch_items)
-            for feature_df in batch_frames:
-                pending_frames.append(feature_df)
-                pending_rows += len(feature_df)
-                if pending_rows >= FEATURE_FLUSH_ROW_THRESHOLD:
-                    updated_rows += flush_pending_frames()
-            if batch_start == 0 or batch_start + FEATURE_READ_CODE_BATCH_SIZE >= len(sync_plan):
+        try:
+            for batch_start in range(0, len(sync_plan), FEATURE_READ_CODE_BATCH_SIZE):
+                batch_items = sync_plan[batch_start : batch_start + FEATURE_READ_CODE_BATCH_SIZE]
                 log_event(
                     "info",
-                    "feature sync progress",
+                    "feature sync batch start",
                     backend="duckdb",
-                    index=f"{min(batch_start + FEATURE_READ_CODE_BATCH_SIZE, len(sync_plan))}/{len(sync_plan)}",
-                    rows=sum(len(frame) for frame in batch_frames),
+                    batch=f"{batch_start // FEATURE_READ_CODE_BATCH_SIZE + 1}/{(len(sync_plan) + FEATURE_READ_CODE_BATCH_SIZE - 1) // FEATURE_READ_CODE_BATCH_SIZE}",
+                    codes=len(batch_items),
                 )
+                batch_frames = self._build_feature_frames_batch(batch_items)
+                for feature_df in batch_frames:
+                    pending_frames.append(feature_df)
+                    pending_rows += len(feature_df)
+                    if pending_rows >= FEATURE_FLUSH_ROW_THRESHOLD:
+                        updated_rows += flush_pending_frames()
+                if batch_start == 0 or batch_start + FEATURE_READ_CODE_BATCH_SIZE >= len(sync_plan):
+                    log_event(
+                        "info",
+                        "feature sync progress",
+                        backend="duckdb",
+                        index=f"{min(batch_start + FEATURE_READ_CODE_BATCH_SIZE, len(sync_plan))}/{len(sync_plan)}",
+                        rows=sum(len(frame) for frame in batch_frames),
+                    )
 
-        updated_rows += flush_pending_frames()
+            updated_rows += flush_pending_frames()
+            if build_table is not None:
+                if updated_rows:
+                    updated_rows = publish_full_build(self.db_client, DUCKDB_FEATURE_TABLE, build_table)
+                else:
+                    log_event("warning", "feature full rebuild skipped publish", backend="duckdb", reason="no_rows_built")
+                    self.db_client.execute(f"drop table if exists {quote_identifier(build_table)}")
+                build_table = None
+        finally:
+            if build_table is not None:
+                self.db_client.execute(f"drop table if exists {quote_identifier(build_table)}")
         log_event("info", "feature sync completed", backend="duckdb", planned_codes=len(sync_plan), updated_rows=updated_rows)
         return {"planned_codes": len(sync_plan), "updated_rows": updated_rows}
 
@@ -549,6 +647,25 @@ class DuckDBFeature:
 Feature = DuckDBFeature
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build DuckDB daily market-value features.")
+    parser.add_argument(
+        "--force-full-refresh",
+        action="store_true",
+        help="Rebuild all available daily feature rows, including historical share-count adjustments.",
+    )
+    parser.add_argument(
+        "--codes",
+        help="Optional comma-separated internal or exchange-formatted stock codes.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    codes = [normalize_internal_code(code.strip()) for code in str(args.codes or "").split(",") if code.strip()]
+    DuckDBFeature().generate_feature(codes=codes or None, force_full_refresh=args.force_full_refresh)
+
+
 if __name__ == "__main__":
-    feature_process = DuckDBFeature()
-    feature_process.generate_feature()
+    main()

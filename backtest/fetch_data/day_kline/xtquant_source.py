@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
+from collections.abc import Mapping
 from typing import Any, Iterable, Sequence
 
 import pandas as pd
@@ -8,36 +10,39 @@ import pandas as pd
 from backtest.db.precision import normalize_amount, normalize_price, normalize_volume
 from backtest.utils import is_blank, safe_float, safe_int, to_trade_datetime
 
-from .constants import XT_DAY_FIELDS, XT_TIMEZONE_OFFSET_HOURS
+from .constants import FIXED_DAY_KLINE_INDEX_CODES, XT_DAY_FIELDS, XT_TIMEZONE_OFFSET_HOURS
 from .models import StockMeta, XtDayRow
-
-
-def field_value(market_data: dict[str, pd.DataFrame], field: str, xt_code: str, column: Any) -> Any:
-    frame = market_data.get(field)
-    if not isinstance(frame, pd.DataFrame):
-        return None
-    if xt_code not in frame.index or column not in frame.columns:
-        return None
-    return frame.loc[xt_code, column]
 
 
 def extract_xt_stock_frame(market_data: dict[str, pd.DataFrame], xt_code: str) -> pd.DataFrame:
     """把 xtquant field->DataFrame 的横向结构，摊平成单只股票按日期排列的行。"""
 
     columns: set[Any] = set()
-    for frame in market_data.values():
-        if isinstance(frame, pd.DataFrame) and xt_code in frame.index:
-            columns.update(frame.columns.tolist())
-    rows: list[dict[str, Any]] = []
-    for column in sorted(columns):
-        row = {"column_time": column}
-        for field in XT_DAY_FIELDS:
-            row[field] = field_value(market_data, field, xt_code, column)
-        rows.append(row)
-    return pd.DataFrame(rows)
+    series_by_field: dict[str, pd.Series] = {}
+    for field in XT_DAY_FIELDS:
+        frame = market_data.get(field)
+        if not isinstance(frame, pd.DataFrame) or xt_code not in frame.index:
+            continue
+        selected = frame.loc[xt_code]
+        if isinstance(selected, pd.DataFrame):
+            selected = selected.iloc[-1]
+        series_by_field[field] = selected
+        columns.update(selected.index.tolist())
+    if not columns:
+        return pd.DataFrame()
+
+    ordered_columns = sorted(columns)
+    result = pd.DataFrame({"column_time": ordered_columns})
+    for field in XT_DAY_FIELDS:
+        series = series_by_field.get(field)
+        result[field] = None if series is None else series.reindex(ordered_columns).tolist()
+    return result
 
 
-def resolve_xt_trade_date(row: pd.Series) -> datetime | None:
+def resolve_xt_trade_date(row: Mapping[str, Any] | pd.Series) -> datetime | None:
+    parsed_date = row.get("_trade_date")
+    if isinstance(parsed_date, datetime):
+        return parsed_date
     raw_time = row.get("time")
     if is_blank(raw_time):
         raw_time = row.get("column_time")
@@ -53,13 +58,27 @@ def resolve_xt_trade_date(row: pd.Series) -> datetime | None:
     return datetime(parsed.year, parsed.month, parsed.day)
 
 
-def is_suspended_xt_row(row: pd.Series) -> bool:
+def is_suspended_xt_row(row: Mapping[str, Any] | pd.Series) -> bool:
     flag = safe_int(row.get("suspendFlag"))
     return flag == 1
 
 
+def normalize_xt_volume(value: Any) -> int | None:
+    """Convert xtquant daily volume from lots to the table's share unit."""
+
+    if value is None or pd.isna(value):
+        return None
+    try:
+        # Index aggregates may contain fractional lots.  Convert first so the
+        # final integer keeps share precision instead of rounding lots early.
+        share_volume = Decimal(str(value)) * Decimal("100")
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return normalize_volume(share_volume)
+
+
 def build_xt_day_doc(
-    row: pd.Series,
+    row: Mapping[str, Any] | pd.Series,
     meta: StockMeta,
     *,
     previous_close: float | None = None,
@@ -74,7 +93,8 @@ def build_xt_day_doc(
     high_price = normalize_price(row.get("high"))
     low_price = normalize_price(row.get("low"))
     close_price = normalize_price(row.get("close"))
-    volume = normalize_volume(row.get("volume"))
+    is_index = meta.code in FIXED_DAY_KLINE_INDEX_CODES
+    volume = normalize_xt_volume(row.get("volume"))
     amount = normalize_amount(row.get("amount"))
     preclose = normalize_price(row.get("preClose"))
     if preclose is None:
@@ -101,7 +121,7 @@ def build_xt_day_doc(
 
     turn = None
     if meta.float_volume not in (None, 0) and volume not in (None, 0):
-        turn = float(volume) * 100.0 / float(meta.float_volume) * 100.0
+        turn = float(volume) / float(meta.float_volume) * 100.0
 
     doc = {
         "code": meta.code,
@@ -142,12 +162,18 @@ def xt_market_data_to_docs(
         frame = extract_xt_stock_frame(market_data, meta.xt_code)
         if frame.empty:
             continue
-        for _, row in frame.iterrows():
+        rows = frame.to_dict("records")
+        for row in rows:
+            trade_date = resolve_xt_trade_date(row)
+            row["_trade_date"] = trade_date
+        rows.sort(key=lambda row: row["_trade_date"] or datetime.min)
+        for row in rows:
+            trade_date = row["_trade_date"]
             result = build_xt_day_doc(
                 row,
                 meta,
                 previous_close=previous_close_by_code.get(meta.code),
-                is_st=bool(st_status_by_code.get(meta.code, {}).get(resolve_xt_trade_date(row), False)),
+                is_st=bool(st_status_by_code.get(meta.code, {}).get(trade_date, False)),
             )
             if result.doc is not None:
                 docs.append(result.doc)

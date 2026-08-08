@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 import pandas as pd
@@ -9,24 +8,26 @@ import pandas as pd
 from backtest.db import DuckDBConfig
 from backtest.fetch_data.baostock_utils import fetch_trade_calendar, login_with_retry, safe_logout
 from backtest.fetch_data.day_kline_common import build_baostock_day_doc, write_day_kline_docs
-from backtest.utils import is_bj_code, is_st_name, to_trade_datetime, to_xt_code
+from backtest.utils import is_bj_code, to_trade_datetime, to_xt_code
 from backtest.utils.log import log_event
 
 from .baostock_source import fetch_baostock_range
-from .constants import DAY_COLLECTION, DEFAULT_LOCAL_ROOT, MAX_MONGO_BATCH_SIZE
-from .local_source import build_local_doc, load_finance_index, read_local_csv
+from .constants import DAY_COLLECTION, MAX_DAILY_SYNC_BATCH_SIZE
 from .missing import build_missing_by_code, filter_xt_results_to_update_window, merge_dates_to_ranges
 from .models import StockMeta
+from .st_status import build_st_status_by_code
 from .universe import (
+    build_expected_dates_by_code,
     build_manual_code_start_map,
-    build_symbol_code_map,
-    load_latest_state_map,
+    latest_available_day_kline_date,
+    load_previous_state_before_start_map,
     load_manual_universe,
     resolve_requested_codes,
 )
+from .xt_details import enrich_stock_metas_with_xt_details, fetch_xt_detail_map
 from .xtquant_source import fetch_xt_market_data, iter_xt_sync_batches, xt_market_data_to_docs
 
-ManualSource = Literal["xtquant", "baostock", "local"]
+ManualSource = Literal["xtquant", "baostock"]
 
 
 def _metas_for_codes(codes: list[str], universe) -> list[StockMeta]:
@@ -55,64 +56,6 @@ def _flush_manual_docs(cfg: DuckDBConfig, docs: list[dict[str, Any]], *, dry_run
     return planned
 
 
-def _trade_codes_for_date(code_start_map, universe, trade_date: datetime) -> list[str]:
-    return [
-        code
-        for code, start in code_start_map.items()
-        if trade_date >= start and (universe[code].out_date is None or trade_date <= universe[code].out_date)
-    ]
-
-
-def _run_local_source(
-    *,
-    cfg: DuckDBConfig,
-    universe,
-    codes: list[str],
-    code_start_map: dict[str, datetime],
-    latest_state_map: dict[str, dict[str, Any]],
-    trade_dates: list[datetime],
-    end_date: datetime,
-    local_root: str | Path,
-    batch_size: int,
-    dry_run: bool,
-) -> tuple[dict[str, set[datetime]], dict[str, Any]]:
-    finance_index = load_finance_index(cfg, codes, end_date)
-    symbol_map = build_symbol_code_map(universe)
-    isst_state = {
-        code: bool(latest_state_map.get(code, {}).get("isST", is_st_name(universe[code].code_name)))
-        for code in codes
-    }
-    docs_to_write: list[dict[str, Any]] = []
-    written_dates_by_code: dict[str, set[datetime]] = {}
-    local_unmatched_total = 0
-    planned_total = 0
-    local_root_path = Path(local_root)
-
-    for trade_date in trade_dates:
-        trade_codes = _trade_codes_for_date(code_start_map, universe, trade_date)
-        if not trade_codes:
-            continue
-        file_path = local_root_path / f"{trade_date:%Y%m%d}.csv"
-        local_frame, unmatched_count = read_local_csv(file_path, symbol_map) if file_path.exists() else (pd.DataFrame(), 0)
-        local_unmatched_total += unmatched_count
-        local_rows_by_code = local_frame.set_index("code", drop=False).to_dict("index") if not local_frame.empty else {}
-        for code in trade_codes:
-            row = local_rows_by_code.get(code)
-            if row is None:
-                continue
-            doc = build_local_doc(pd.Series(row), code, trade_date, isst_state.get(code, False), finance_index)
-            written_dates_by_code.setdefault(code, set()).add(trade_date)
-            docs_to_write.append(doc)
-            if len(docs_to_write) >= batch_size:
-                planned_total += _flush_manual_docs(cfg, docs_to_write, dry_run=dry_run)
-
-    planned_total += _flush_manual_docs(cfg, docs_to_write, dry_run=dry_run)
-    return written_dates_by_code, {
-        "local_unmatched_codes": local_unmatched_total,
-        "planned_total": planned_total,
-    }
-
-
 def _run_baostock_source(
     *,
     cfg: DuckDBConfig,
@@ -125,6 +68,7 @@ def _run_baostock_source(
     written_dates_by_code: dict[str, set[datetime]] = {}
     skipped_bj_rows = 0
     planned_total = 0
+    write_batches = 0
     for code, missing_dates in expected_dates_by_code.items():
         if is_bj_code(code):
             skipped_bj_rows += len(missing_dates)
@@ -142,11 +86,17 @@ def _run_baostock_source(
                 docs_to_write.append(doc)
                 if len(docs_to_write) >= batch_size:
                     planned_total += _flush_manual_docs(cfg, docs_to_write, dry_run=dry_run)
+                    if not dry_run:
+                        write_batches += 1
 
-    planned_total += _flush_manual_docs(cfg, docs_to_write, dry_run=dry_run)
+    remaining = _flush_manual_docs(cfg, docs_to_write, dry_run=dry_run)
+    planned_total += remaining
+    if remaining and not dry_run:
+        write_batches += 1
     return written_dates_by_code, {
         "planned_total": planned_total,
         "skipped_bj_rows": skipped_bj_rows,
+        "write_batches": write_batches,
     }
 
 
@@ -154,33 +104,45 @@ def _run_xtquant_source(
     *,
     cfg: DuckDBConfig,
     xtdata_client,
-    universe,
-    codes: list[str],
+    metas: list[StockMeta],
     code_start_map: dict[str, datetime],
     expected_dates_by_code: dict[str, set[datetime]],
-    latest_state_map: dict[str, dict[str, Any]],
+    previous_state_before_start_map: dict[str, dict[str, Any]],
+    st_status_by_code: dict[str, dict[datetime, bool]],
     end_date: datetime,
     batch_size: int,
     xt_batch_size: int,
     dry_run: bool,
 ) -> tuple[dict[str, set[datetime]], dict[str, list[datetime]], dict[str, Any]]:
-    metas = _metas_for_codes(codes, universe)
     written_dates_by_code: dict[str, set[datetime]] = {}
     all_invalid_dates: dict[str, list[datetime]] = {}
     planned_total = 0
+    write_batches = 0
     for batch_start, batch_metas in iter_xt_sync_batches(metas, code_start_map, xt_batch_size=xt_batch_size):
         market_data = fetch_xt_market_data(xtdata_client, [meta.xt_code for meta in batch_metas], batch_start, end_date)
-        docs, invalid_dates = xt_market_data_to_docs(market_data, batch_metas, latest_state_map)
+        docs, invalid_dates = xt_market_data_to_docs(
+            market_data,
+            batch_metas,
+            previous_state_before_start_map,
+            st_status_by_code=st_status_by_code,
+        )
         docs, invalid_dates = filter_xt_results_to_update_window(expected_dates_by_code, docs, invalid_dates)
-        if docs:
+        for start in range(0, len(docs), batch_size):
+            batch = docs[start : start + batch_size]
+            if not batch:
+                continue
             if not dry_run:
-                write_day_kline_docs(cfg, DAY_COLLECTION, docs)
-            planned_total += len(docs)
-            for doc in docs:
+                write_day_kline_docs(cfg, DAY_COLLECTION, batch)
+                write_batches += 1
+            planned_total += len(batch)
+            for doc in batch:
                 written_dates_by_code.setdefault(str(doc["code"]), set()).add(to_trade_datetime(doc["date"]))
         for code, dates in invalid_dates.items():
             all_invalid_dates.setdefault(code, []).extend(dates)
-    return written_dates_by_code, all_invalid_dates, {"planned_total": planned_total}
+    return written_dates_by_code, all_invalid_dates, {
+        "planned_total": planned_total,
+        "write_batches": write_batches,
+    }
 
 
 def run_manual_day_kline_sync(
@@ -189,17 +151,67 @@ def run_manual_day_kline_sync(
     stocks: str,
     start_date: datetime,
     end_date: datetime,
-    local_root: str | Path = DEFAULT_LOCAL_ROOT,
     xtdata_client=None,
     cfg: DuckDBConfig | None = None,
     batch_size: int = 2000,
     xt_batch_size: int = 300,
+    max_attempts: int = 3,
     dry_run: bool = False,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
-    if source not in {"xtquant", "baostock", "local"}:
-        raise ValueError("source must be one of: xtquant, baostock, local")
+    if source not in {"xtquant", "baostock"}:
+        raise ValueError("source must be one of: xtquant, baostock")
     if start_date > end_date:
         raise ValueError("start_date must be <= end_date")
+    cfg = cfg or DuckDBConfig()
+    batch_size = max(1, min(int(batch_size), MAX_DAILY_SYNC_BATCH_SIZE))
+    xt_batch_size = max(1, int(xt_batch_size))
+    now = now or datetime.now()
+    candidate_end_date = latest_available_day_kline_date(now)
+    requested_end_date = end_date
+    end_date = min(end_date, candidate_end_date)
+    universe = load_manual_universe(cfg, requested_end_date)
+    codes = resolve_requested_codes(stocks, universe)
+    base_summary: dict[str, Any] = {
+        "source": source,
+        "requested_codes": len(codes),
+        "active_codes": 0,
+        "start_date": start_date.strftime("%Y-%m-%d"),
+        "requested_end_date": requested_end_date.strftime("%Y-%m-%d"),
+        "end_date": end_date.strftime("%Y-%m-%d"),
+        "candidate_end_date": candidate_end_date.strftime("%Y-%m-%d"),
+        "market_close_time": "15:45:00",
+        "end_date_truncated": end_date < requested_end_date,
+        "trade_days": 0,
+        "planned_total": 0,
+        "written_total": 0,
+        "skipped_bj_rows": 0,
+        "missing_days": 0,
+        "missing_by_code": {},
+        "write_batches": 0,
+        "dry_run": dry_run,
+    }
+    log_event(
+        "info",
+        "manual daily kline cutoff resolved",
+        source=source,
+        beijing_now=now,
+        market_close_time="15:45:00",
+        requested_end_date=requested_end_date.strftime("%Y-%m-%d"),
+        effective_end_date=end_date.strftime("%Y-%m-%d"),
+        end_date_truncated=end_date < requested_end_date,
+    )
+    if start_date > end_date:
+        log_event(
+            "info",
+            "manual daily kline skipped before market close",
+            source=source,
+            start_date=start_date.strftime("%Y-%m-%d"),
+            effective_end_date=end_date.strftime("%Y-%m-%d"),
+        )
+        base_summary["skip_reason"] = "no_closed_day_in_requested_range"
+        return base_summary
+
     if source == "xtquant" and xtdata_client is None:
         from .daily_sync import default_xtdata
 
@@ -207,42 +219,29 @@ def run_manual_day_kline_sync(
         if xtdata_client is None:
             raise RuntimeError("xtquant is not available in current Python environment")
 
-    cfg = cfg or DuckDBConfig()
-    batch_size = max(1, min(int(batch_size), MAX_MONGO_BATCH_SIZE))
-    xt_batch_size = max(1, int(xt_batch_size))
-    needs_baostock_login = True
-    if needs_baostock_login:
-        login_with_retry()
+    login_with_retry()
     try:
-        universe = load_manual_universe(cfg, end_date)
-        codes = resolve_requested_codes(stocks, universe)
-        latest_state_map = load_latest_state_map(cfg, codes, end_date)
-        code_start_map = build_manual_code_start_map(codes, universe, latest_state_map, start_date, end_date)
-        trade_dates = fetch_trade_calendar(min(code_start_map.values()) if code_start_map else start_date, end_date)
+        code_start_map = build_manual_code_start_map(codes, universe, start_date, end_date)
+        calendar_start_date = min(code_start_map.values()) if code_start_map else start_date
+        log_event(
+            "info",
+            "manual daily kline trade calendar query",
+            start_date=calendar_start_date.strftime("%Y-%m-%d"),
+            end_date=end_date.strftime("%Y-%m-%d"),
+        )
+        trade_dates = fetch_trade_calendar(calendar_start_date, end_date)
         trade_day_positions = {trade_date: index for index, trade_date in enumerate(trade_dates)}
-        expected_dates_by_code = {
-            code: {
-                trade_date
-                for trade_date in trade_dates
-                if trade_date >= code_start_map.get(code, end_date) and trade_date <= end_date
-            }
-            for code in code_start_map
-        }
+        metas = _metas_for_codes(codes, universe)
+        expected_dates_by_code = build_expected_dates_by_code(
+            metas,
+            code_start_map,
+            trade_dates,
+            end_date,
+        )
 
-        summary: dict[str, Any] = {
-            "source": source,
-            "requested_codes": len(codes),
-            "active_codes": len(code_start_map),
-            "start_date": start_date.strftime("%Y-%m-%d"),
-            "end_date": end_date.strftime("%Y-%m-%d"),
-            "trade_days": len(trade_dates),
-            "planned_total": 0,
-            "written_total": 0,
-            "skipped_bj_rows": 0,
-            "missing_days": 0,
-            "missing_by_code": {},
-            "dry_run": dry_run,
-        }
+        summary = dict(base_summary)
+        summary["active_codes"] = len(code_start_map)
+        summary["trade_days"] = len(trade_dates)
         if not code_start_map:
             log_event("info", "manual daily kline no codes need update", requested_codes=len(codes), source=source)
             return summary
@@ -255,22 +254,7 @@ def run_manual_day_kline_sync(
             dry_run=dry_run,
         )
 
-        if source == "local":
-            written_dates_by_code, source_summary = _run_local_source(
-                cfg=cfg,
-                universe=universe,
-                codes=codes,
-                code_start_map=code_start_map,
-                latest_state_map=latest_state_map,
-                trade_dates=trade_dates,
-                end_date=end_date,
-                local_root=local_root,
-                batch_size=batch_size,
-                dry_run=dry_run,
-            )
-            missing_by_code = build_missing_by_code(expected_dates_by_code, written_dates_by_code, {})
-
-        elif source == "baostock":
+        if source == "baostock":
             written_dates_by_code, source_summary = _run_baostock_source(
                 cfg=cfg,
                 expected_dates_by_code=expected_dates_by_code,
@@ -281,19 +265,63 @@ def run_manual_day_kline_sync(
             missing_by_code = build_missing_by_code(expected_dates_by_code, written_dates_by_code, {})
 
         else:
+            previous_state_before_start_map = load_previous_state_before_start_map(
+                cfg,
+                code_start_map,
+            )
+            active_metas = [meta for meta in metas if meta.code in code_start_map]
+            active_stock_codes = {
+                meta.code
+                for meta in active_metas
+                if not universe[meta.code].is_index
+            }
+            active_xt_codes = [
+                meta.xt_code
+                for meta in active_metas
+                if not universe[meta.code].is_index
+            ]
+            current_details_by_xt_code = fetch_xt_detail_map(
+                xtdata_client,
+                active_xt_codes,
+            )
+            active_metas, detail_stats = enrich_stock_metas_with_xt_details(
+                active_metas,
+                current_details_by_xt_code,
+                active_codes=active_stock_codes,
+            )
+            latest_trade_date = trade_dates[-1] if trade_dates else end_date
+            stock_expected_dates = {
+                code: dates
+                for code, dates in expected_dates_by_code.items()
+                if code in active_stock_codes
+            }
+            st_status_by_code = build_st_status_by_code(
+                xtdata_client,
+                stock_expected_dates,
+                latest_trade_date + timedelta(days=1),
+                current_details_by_xt_code=current_details_by_xt_code,
+                max_attempts=max_attempts,
+            )
+            for meta in active_metas:
+                if universe[meta.code].is_index:
+                    st_status_by_code[meta.code] = {
+                        trade_date: False
+                        for trade_date in expected_dates_by_code.get(meta.code, set())
+                    }
             written_dates_by_code, all_invalid_dates, source_summary = _run_xtquant_source(
                 cfg=cfg,
                 xtdata_client=xtdata_client,
-                universe=universe,
-                codes=codes,
+                metas=active_metas,
                 code_start_map=code_start_map,
                 expected_dates_by_code=expected_dates_by_code,
-                latest_state_map=latest_state_map,
+                previous_state_before_start_map=previous_state_before_start_map,
+                st_status_by_code=st_status_by_code,
                 end_date=end_date,
                 batch_size=batch_size,
                 xt_batch_size=xt_batch_size,
                 dry_run=dry_run,
             )
+            source_summary.update(detail_stats)
             missing_by_code = build_missing_by_code(expected_dates_by_code, written_dates_by_code, all_invalid_dates)
 
         summary.update(source_summary)
@@ -311,5 +339,4 @@ def run_manual_day_kline_sync(
         )
         return summary
     finally:
-        if needs_baostock_login:
-            safe_logout()
+        safe_logout()

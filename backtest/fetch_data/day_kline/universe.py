@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any, Sequence
+from zoneinfo import ZoneInfo
+
+import pandas as pd
 
 from backtest.db import DuckDBConfig
 from backtest.utils import (
@@ -21,10 +24,23 @@ from .constants import (
     DAY_COLLECTION,
     FIXED_DAY_KLINE_INDEX_CODES,
     FIXED_DAY_KLINE_INDEX_NAME,
-    MANUAL_STOCK_GAP_FLOOR_DATE,
     MIN_DAY_KLINE_START_DATE,
 )
 from .models import SecurityMeta, StockMeta
+
+
+BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
+DAY_KLINE_CLOSE_TIME = time(15, 45)
+
+
+def latest_available_day_kline_date(now: datetime) -> datetime:
+    """Return the latest calendar date whose daily bar may be fetched."""
+
+    local_now = now.replace(tzinfo=BEIJING_TIMEZONE) if now.tzinfo is None else now.astimezone(BEIJING_TIMEZONE)
+    result = datetime(local_now.year, local_now.month, local_now.day)
+    if local_now.time().replace(tzinfo=None) < DAY_KLINE_CLOSE_TIME:
+        result -= timedelta(days=1)
+    return result
 
 
 def fixed_day_kline_index_metas() -> list[StockMeta]:
@@ -61,26 +77,31 @@ def merge_fixed_day_kline_indexes(stock_metas: Sequence[StockMeta]) -> tuple[lis
 def load_latest_state_map(cfg: DuckDBConfig, codes: Sequence[str], end_date: datetime) -> dict[str, dict[str, Any]]:
     if not codes:
         return {}
-    placeholders = ", ".join(["?"] * len(codes))
-    params = [*list(codes), end_date]
-    frame = cfg.fetch_df(
-        f"""
-        select code, date, c as close, isST
-        from (
+    scope = pd.DataFrame({"code": sorted(set(codes))})
+    with cfg.registered_frame("_latest_state_scope", scope):
+        frame = cfg.fetch_df(
+            f"""
             select
                 code,
-                date,
-                c,
-                isST,
-                row_number() over (partition by code order by date desc) as rn
-            from "{DAY_COLLECTION}"
-            where code in ({placeholders}) and date <= ?
+                state.date as date,
+                state.close as close,
+                state.is_st as isST
+            from (
+                select
+                    scope.code,
+                    arg_max(
+                        struct_pack(date := history.date, close := history.c, is_st := history.isST),
+                        history.date
+                    ) as state
+                from _latest_state_scope as scope
+                join "{DAY_COLLECTION}" as history on history.code = scope.code
+                where history.date <= ?
+                group by scope.code
+            )
+            order by code
+            """,
+            [end_date],
         )
-        where rn = 1
-        order by code
-        """,
-        params,
-    )
     result: dict[str, dict[str, Any]] = {}
     for row in frame.to_dict("records"):
         code = str(row.get("code", "")).strip().lower()
@@ -91,6 +112,88 @@ def load_latest_state_map(cfg: DuckDBConfig, codes: Sequence[str], end_date: dat
                 "isST": bool(row.get("isST", False)),
             }
     return result
+
+
+def load_previous_state_before_start_map(
+    cfg: DuckDBConfig,
+    code_start_map: dict[str, datetime],
+) -> dict[str, dict[str, Any]]:
+    """Load one internally consistent row strictly before each code's backfill start."""
+
+    if not code_start_map:
+        return {}
+    scope = pd.DataFrame(
+        [
+            {"code": code, "start_date": to_trade_datetime(start_date)}
+            for code, start_date in sorted(code_start_map.items())
+        ]
+    )
+    with cfg.registered_frame("_previous_state_scope", scope):
+        frame = cfg.fetch_df(
+            f"""
+            select
+                code,
+                state.date as date,
+                state.close as close,
+                state.is_st as isST
+            from (
+                select
+                    scope.code,
+                    arg_max(
+                        struct_pack(date := history.date, close := history.c, is_st := history.isST),
+                        history.date
+                    ) as state
+                from _previous_state_scope as scope
+                join "{DAY_COLLECTION}" as history
+                  on history.code = scope.code
+                 and history.date < scope.start_date
+                group by scope.code
+            )
+            order by code
+            """
+        )
+    return {
+        str(row["code"]).strip().lower(): {
+            "date": to_trade_datetime(row["date"]),
+            "close": safe_float(row.get("close")),
+            "isST": bool(row.get("isST", False)),
+        }
+        for row in frame.to_dict("records")
+        if str(row.get("code", "")).strip()
+    }
+
+
+def load_previous_trade_date_stock_count(
+    cfg: DuckDBConfig,
+    latest_trade_date: datetime,
+) -> tuple[datetime | None, int]:
+    frame = cfg.fetch_df(
+        f"""
+        with previous as (
+            select max(history.date) as trade_date
+            from "{DAY_COLLECTION}" as history
+            inner join "{BASIC_INFO_COLLECTION}" as basic on basic.code = history.code
+            where history.date < ?
+              and (lower(basic.code) like 'sh.%' or lower(basic.code) like 'sz.%')
+        )
+        select
+            previous.trade_date,
+            count(distinct history.code) as stock_count
+        from previous
+        left join "{DAY_COLLECTION}" as history on history.date = previous.trade_date
+        left join "{BASIC_INFO_COLLECTION}" as basic on basic.code = history.code
+        where basic.code is not null
+          and (lower(history.code) like 'sh.%' or lower(history.code) like 'sz.%')
+        group by previous.trade_date
+        """,
+        [to_trade_datetime(latest_trade_date)],
+    )
+    if frame.empty or pd.isna(frame.iloc[0].get("trade_date")):
+        return None, 0
+    return (
+        to_trade_datetime(frame.iloc[0]["trade_date"]),
+        int(frame.iloc[0]["stock_count"]),
+    )
 
 
 def build_code_start_map(
@@ -153,11 +256,18 @@ def build_day_kline_update_universe(
     basic_docs: Sequence[dict[str, Any]],
     stock_pool_diff_rows: Sequence[dict[str, Any]],
     today: datetime,
+    *,
+    excluded_db_only_codes: Sequence[str] | None = None,
 ) -> tuple[list[StockMeta], dict[str, int]]:
+    if excluded_db_only_codes is None:
+        excluded_db_only_codes = [
+            str(row["code"])
+            for row in stock_pool_diff_rows
+            if row.get("diff_type") == "db_only"
+        ]
     db_only_codes = {
-        normalize_internal_code(str(row["code"]))
-        for row in stock_pool_diff_rows
-        if row.get("diff_type") == "db_only"
+        normalize_internal_code(str(code))
+        for code in (excluded_db_only_codes or ())
     }
     metas: list[StockMeta] = []
     stats = {
@@ -288,7 +398,6 @@ def resolve_requested_codes(selector_text: str, universe: dict[str, SecurityMeta
 def build_manual_code_start_map(
     codes: Sequence[str],
     universe: dict[str, SecurityMeta],
-    latest_state_map: dict[str, dict[str, Any]],
     explicit_start_date: datetime,
     end_date: datetime,
 ) -> dict[str, datetime]:
@@ -296,8 +405,6 @@ def build_manual_code_start_map(
     for code in codes:
         meta = universe[code]
         start_date = explicit_start_date
-        if not meta.is_index and start_date < MANUAL_STOCK_GAP_FLOOR_DATE:
-            start_date = MANUAL_STOCK_GAP_FLOOR_DATE
         if meta.ipo_date is not None and start_date < meta.ipo_date:
             start_date = meta.ipo_date
         if meta.out_date is not None and start_date > meta.out_date:

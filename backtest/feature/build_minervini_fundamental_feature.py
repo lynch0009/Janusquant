@@ -14,6 +14,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from backtest.db import DuckDBConfig, quote_identifier, upsert_frame
+from backtest.db.duckdb_managed_writer import (
+    append_build_frame,
+    create_build_table,
+    managed_table_missing_columns,
+    merge_build_upsert,
+)
+from backtest.fetch_data.finance_common import FINANCE_COVERAGE_START
 from backtest.utils import normalize_internal_code
 from backtest.feature.minervini_fundamental_feature import (
     FEATURE_FIELDS,
@@ -29,7 +36,8 @@ from backtest.utils.log import log_event
 
 DEFAULT_BATCH_SIZE = 300
 DEFAULT_LOOKBACK_QUARTERS = 8
-WARMUP_QUARTERS = 8
+# 年度连续增长与三段加速度最多需要五份连续年报，预热窗口覆盖二十个财季。
+WARMUP_QUARTERS = 20
 
 
 def parse_args() -> argparse.Namespace:
@@ -144,13 +152,33 @@ def load_codes(db: DuckDBConfig, *, requested_codes: list[str], read_query: dict
     return codes
 
 
-def load_source_frame(db: DuckDBConfig, *, codes: list[str], read_query: dict[str, Any]) -> pd.DataFrame:
+def load_source_frame(
+    db: DuckDBConfig,
+    *,
+    codes: list[str],
+    read_query: dict[str, Any],
+    existing_fields: set[str] | None = None,
+) -> pd.DataFrame:
     if not codes:
         return pd.DataFrame()
     query = dict(read_query)
     query["code"] = {"$in": codes}
     clauses, params = _where_from_query(query)
-    fields = [quote_identifier(field) for field in SOURCE_FIELDS]
+    if existing_fields is None:
+        existing_fields = {
+            str(row[0])
+            for row in db.connection.execute(f"describe {quote_identifier(SOURCE_COLLECTION)}").fetchall()
+        }
+    missing_keys = [field for field in ("code", "statDate") if field not in existing_fields]
+    if missing_keys:
+        raise ValueError(f"财务源表缺少必要字段：{missing_keys}")
+    # 兼容尚未跑过新版采集器的旧表；新增累计字段先补空值，特征层会退回严格单季 TTM 或年报口径。
+    fields = [
+        quote_identifier(field)
+        if field in existing_fields
+        else f"null as {quote_identifier(field)}"
+        for field in SOURCE_FIELDS
+    ]
     return db.fetch_df(
         f"""
         select {', '.join(fields)}
@@ -210,14 +238,15 @@ def summarize_features(frame: pd.DataFrame) -> dict[str, Any]:
 
 def resolve_mode_dates(db: DuckDBConfig, args: argparse.Namespace) -> tuple[dict[str, Any], datetime | None, datetime | None, list[datetime] | None]:
     if args.mode == "full":
-        target_start = parse_date(args.start_date)
+        target_start = parse_date(args.start_date) or FINANCE_COVERAGE_START
         target_end = parse_date(args.end_date)
         read_start = warmup_start(target_start)
         read_query = date_range_query(read_start, target_end)
         return read_query, target_start, target_end, None
 
-    target_dates = latest_stat_dates(db, args.lookback_quarters)
+    # 一次读取最大预热窗口，避免 incremental 模式重复扫描季度列表。
     read_dates = latest_stat_dates(db, args.lookback_quarters + WARMUP_QUARTERS)
+    target_dates = read_dates[: args.lookback_quarters]
     read_query = {"statDate": {"$in": read_dates}}
     return read_query, None, None, target_dates
 
@@ -229,6 +258,19 @@ def run(args: argparse.Namespace) -> None:
     requested_codes = split_codes(args.codes)
     read_query, target_start, target_end, target_stat_dates = resolve_mode_dates(db, args)
     codes = load_codes(db, requested_codes=requested_codes, read_query=read_query, limit=args.limit)
+    source_fields = {
+        str(row[0]) for row in db.connection.execute(f"describe {quote_identifier(SOURCE_COLLECTION)}").fetchall()
+    }
+    missing_target_columns = managed_table_missing_columns(db, TARGET_COLLECTION)
+    use_staging_publish = not args.dry_run and not missing_target_columns
+    build_table = create_build_table(db, TARGET_COLLECTION) if use_staging_publish else None
+    if missing_target_columns:
+        log_event(
+            "warning",
+            "minervini_feature_legacy_schema_fallback",
+            missing_columns=sorted(missing_target_columns),
+            action="use_generic_upsert_until_duckdb_optimized",
+        )
 
     log_event(
         "info",
@@ -243,7 +285,7 @@ def run(args: argparse.Namespace) -> None:
     )
 
     total_source_rows = 0
-    total_valid_notice_rows = 0
+    total_source_rows_with_notice_date = 0
     total_feature_rows = 0
     total_missing_core_rows = 0
     total_yoy_extreme_rows = 0
@@ -251,43 +293,91 @@ def run(args: argparse.Namespace) -> None:
     computed_at = datetime.now()
 
     code_batches = batched(codes, args.batch_size)
-    for batch_number, code_batch in enumerate(code_batches, start=1):
-        source_frame = load_source_frame(db, codes=code_batch, read_query=read_query)
-        total_source_rows += len(source_frame)
-        valid_notice_rows = int(pd.to_datetime(source_frame.get("noticeDate"), errors="coerce").notna().sum()) if not source_frame.empty else 0
-        total_valid_notice_rows += valid_notice_rows
+    try:
+        for batch_number, code_batch in enumerate(code_batches, start=1):
+            source_frame = load_source_frame(
+                db,
+                codes=code_batch,
+                read_query=read_query,
+                existing_fields=source_fields,
+            )
+            total_source_rows += len(source_frame)
+            source_rows_with_notice_date = (
+                int(pd.to_datetime(source_frame.get("noticeDate"), errors="coerce").notna().sum())
+                if not source_frame.empty
+                else 0
+            )
+            total_source_rows_with_notice_date += source_rows_with_notice_date
 
-        feature_frame = build_minervini_fundamental_features(
-            source_frame,
-            computed_at=computed_at,
-            feature_version=FEATURE_VERSION,
-            write_start_date=target_start,
-            write_end_date=target_end,
-            target_stat_dates=target_stat_dates,
-        )
-        stats = summarize_features(feature_frame)
-        total_feature_rows += int(stats["feature_rows"])
-        total_missing_core_rows += int(stats["missing_core_rows"])
-        total_yoy_extreme_rows += int(stats["yoy_extreme_rows"])
+            feature_frame = build_minervini_fundamental_features(
+                source_frame,
+                computed_at=computed_at,
+                feature_version=FEATURE_VERSION,
+                write_start_date=target_start,
+                write_end_date=target_end,
+                target_stat_dates=target_stat_dates,
+            )
+            stats = summarize_features(feature_frame)
+            total_feature_rows += int(stats["feature_rows"])
+            total_missing_core_rows += int(stats["missing_core_rows"])
+            total_yoy_extreme_rows += int(stats["yoy_extreme_rows"])
 
-        if not args.dry_run and not feature_frame.empty:
-            docs = frame_to_docs(feature_frame)
-            if docs:
-                upsert_frame(db, TARGET_COLLECTION, docs, key_columns=("code", "statDate", "featureVersion"))
-                total_write_batches += 1
+            if not args.dry_run and not feature_frame.empty:
+                if build_table is not None:
+                    append_build_frame(db, TARGET_COLLECTION, build_table, feature_frame)
+                else:
+                    docs = frame_to_docs(feature_frame)
+                    if docs:
+                        upsert_frame(db, TARGET_COLLECTION, docs, key_columns=("code", "statDate", "featureVersion"))
+                        total_write_batches += 1
 
-        log_event(
-            "info",
-            "minervini_fundamental_feature_batch_done",
-            batch=f"{batch_number}/{len(code_batches)}",
-            batch_codes=len(code_batch),
-            source_rows=len(source_frame),
-            valid_notice_rows=valid_notice_rows,
-            feature_rows=stats["feature_rows"],
-            missing_core_rows=stats["missing_core_rows"],
-            yoy_extreme_rows=stats["yoy_extreme_rows"],
-            pending_writes=0,
-        )
+            log_event(
+                "info",
+                "minervini_fundamental_feature_batch_done",
+                batch=f"{batch_number}/{len(code_batches)}",
+                batch_codes=len(code_batch),
+                source_rows=len(source_frame),
+                source_rows_with_notice_date=source_rows_with_notice_date,
+                feature_rows=stats["feature_rows"],
+                missing_core_rows=stats["missing_core_rows"],
+                yoy_extreme_rows=stats["yoy_extreme_rows"],
+                pending_writes=0 if build_table is None else stats["feature_rows"],
+            )
+
+        if build_table is not None:
+            if total_feature_rows:
+                replace_scope_sql = None
+                replace_scope_params: tuple[Any, ...] = ()
+                if args.mode == "full" and not requested_codes:
+                    if target_start is None and target_end is None:
+                        replace_scope_sql = "featureVersion = ?"
+                        replace_scope_params = (FEATURE_VERSION,)
+                    else:
+                        range_clauses = ["featureVersion = ?"]
+                        range_params: list[Any] = [FEATURE_VERSION]
+                        if target_start is not None:
+                            range_clauses.append("statDate >= ?")
+                            range_params.append(target_start)
+                        if target_end is not None:
+                            range_clauses.append("statDate <= ?")
+                            range_params.append(target_end)
+                        replace_scope_sql = " and ".join(range_clauses)
+                        replace_scope_params = tuple(range_params)
+                merge_build_upsert(
+                    db,
+                    TARGET_COLLECTION,
+                    build_table,
+                    replace_scope_sql=replace_scope_sql,
+                    replace_scope_params=replace_scope_params,
+                )
+            else:
+                log_event("warning", "minervini_fundamental_feature_skip_publish", reason="no_rows_built")
+                db.execute(f"drop table if exists {quote_identifier(build_table)}")
+            build_table = None
+            total_write_batches = 1 if total_feature_rows else 0
+    finally:
+        if build_table is not None:
+            db.execute(f"drop table if exists {quote_identifier(build_table)}")
 
     elapsed = (datetime.now() - started_at).total_seconds()
     log_event(
@@ -296,8 +386,8 @@ def run(args: argparse.Namespace) -> None:
         mode=args.mode,
         codes=len(codes),
         source_rows=total_source_rows,
-        valid_notice_rows=total_valid_notice_rows,
-        skipped_missing_notice_rows=total_source_rows - total_valid_notice_rows,
+        source_rows_with_notice_date=total_source_rows_with_notice_date,
+        source_rows_missing_notice_date=total_source_rows - total_source_rows_with_notice_date,
         feature_rows=total_feature_rows,
         missing_core_rows=total_missing_core_rows,
         yoy_extreme_rows=total_yoy_extreme_rows,

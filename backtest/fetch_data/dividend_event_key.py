@@ -78,8 +78,9 @@ def normalize_event_year(value: Any) -> int | None:
 def build_dividend_event_key(doc: dict[str, Any], *, query_year: int | None = None) -> str:
     """Build a stable key for one operate-year dividend event.
 
-    The ex-dividend/operate date is included to distinguish multiple same-year
-    dividend events that have identical economic terms.
+    The economic implementation fields define the event identity. Raw plan
+    text intentionally does not: providers often change wording without
+    changing the actual corporate action.
     """
 
     resolved_query_year = normalize_event_year(query_year if query_year is not None else doc.get("queryYear"))
@@ -87,20 +88,6 @@ def build_dividend_event_key(doc: dict[str, Any], *, query_year: int | None = No
         normalize_event_text(doc.get("code")),
         resolved_query_year,
         normalize_event_date(doc.get(EVENT_KEY_DATE_FIELD)),
-        normalize_event_text(doc.get("dividCashStock")),
-    ]
-    parts.extend(normalize_event_float(doc.get(field)) for field in EVENT_KEY_FLOAT_FIELDS)
-    return json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
-
-
-def build_legacy_dividend_event_key(doc: dict[str, Any], *, query_year: int | None = None) -> str:
-    """Build the pre-operate-date event key for matching existing documents."""
-
-    resolved_query_year = normalize_event_year(query_year if query_year is not None else doc.get("queryYear"))
-    parts: list[Any] = [
-        normalize_event_text(doc.get("code")),
-        resolved_query_year,
-        normalize_event_text(doc.get("dividCashStock")),
     ]
     parts.extend(normalize_event_float(doc.get(field)) for field in EVENT_KEY_FLOAT_FIELDS)
     return json.dumps(parts, ensure_ascii=False, separators=(",", ":"))

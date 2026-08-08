@@ -1,4 +1,4 @@
-"""Mongo basic_info 股票池加载工具。"""
+"""Stock-universe loading helpers."""
 
 from __future__ import annotations
 
@@ -43,59 +43,6 @@ def _is_supported_stock(item: BasicStockWindow, *, hs_only: bool) -> bool:
     if hs_only:
         return is_hs_a_share_code(item.code)
     return item.code.startswith(("sh.", "sz.", "bj."))
-
-
-def load_stock_windows(
-    collection,
-    *,
-    start_date: datetime | None = None,
-    end_date: datetime | None = None,
-    active_on: datetime | None = None,
-    hs_only: bool = True,
-) -> list[BasicStockWindow]:
-    query: dict[str, Any] = {}
-    if end_date is not None:
-        query["ipoDate"] = {"$lte": end_date}
-    if start_date is not None:
-        query["$or"] = [{"outDate": None}, {"outDate": {"$gte": start_date}}]
-    if active_on is not None:
-        query["ipoDate"] = {"$lte": active_on}
-        query["$or"] = [{"outDate": None}, {"outDate": {"$gte": active_on}}]
-
-    cursor = collection.find(
-        query,
-        {"_id": 0, "code": 1, "code_name": 1, "ipoDate": 1, "outDate": 1},
-    ).sort("code", 1)
-
-    stocks: list[BasicStockWindow] = []
-    for doc in cursor:
-        item = _doc_to_stock(doc)
-        if item is None or not _is_supported_stock(item, hs_only=hs_only):
-            continue
-        stocks.append(item)
-    return stocks
-
-
-def load_stock_windows_by_codes(collection, codes: Sequence[str]) -> list[BasicStockWindow]:
-    normalized_codes = [normalize_internal_code(code) for code in codes]
-    if not normalized_codes:
-        return []
-
-    cursor = collection.find(
-        {"code": {"$in": normalized_codes}},
-        {"_id": 0, "code": 1, "code_name": 1, "ipoDate": 1, "outDate": 1},
-    )
-    doc_map = {normalize_internal_code(str(doc.get("code", ""))): doc for doc in cursor if doc.get("code")}
-
-    stocks: list[BasicStockWindow] = []
-    for code in normalized_codes:
-        doc = doc_map.get(code)
-        if doc is None:
-            stocks.append(BasicStockWindow(code=code, code_name="", ipo_date=None, out_date=None))
-            continue
-        item = _doc_to_stock(doc)
-        stocks.append(item or BasicStockWindow(code=code, code_name="", ipo_date=None, out_date=None))
-    return stocks
 
 
 def _frame_to_stock_windows(frame: pd.DataFrame, *, hs_only: bool = True) -> list[BasicStockWindow]:

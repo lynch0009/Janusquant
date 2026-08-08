@@ -11,18 +11,18 @@ except ImportError:  # pragma: no cover - unit tests run without xtquant in some
 from backtest.db import DuckDBConfig
 from backtest.fetch_data.baostock_utils import fetch_trade_calendar, login_with_retry, safe_logout
 from backtest.fetch_data.day_kline_common import write_day_kline_docs
-from backtest.utils import is_bj_code
+from backtest.utils import is_bj_code, is_hs_a_share_code
 from backtest.utils.log import log_event
 
 from .baostock_source import fallback_missing_dates_with_baostock
-from .basic_info import load_basic_docs, sync_incremental_basic_info
+from .basic_info import load_basic_docs, project_basic_docs, sync_incremental_basic_info
 from .constants import (
     DAY_COLLECTION,
     DEFAULT_MAX_FALLBACK_MISSING_DAYS,
     DEFAULT_MAX_FALLBACK_MISSING_STOCKS,
     FALLBACK_WINDOW_TRADE_DAYS,
     FIXED_DAY_KLINE_INDEX_CODES,
-    MAX_MONGO_BATCH_SIZE,
+    MAX_DAILY_SYNC_BATCH_SIZE,
 )
 from .missing import (
     add_fallback_counts_by_date,
@@ -30,8 +30,8 @@ from .missing import (
     build_historical_missing_rows,
     build_missing_by_code,
     filter_xt_results_to_update_window,
-    missing_codes_on_latest_trade_date,
     split_missing_by_fallback_window,
+    unresolved_after_fallback,
 )
 from .models import DailySyncSummaryBuilder
 from .report import should_write_report, write_daily_sync_report
@@ -40,20 +40,37 @@ from .universe import (
     build_code_start_map,
     build_day_kline_update_universe,
     build_expected_dates_by_code,
+    latest_available_day_kline_date,
     load_latest_state_map,
+    load_previous_trade_date_stock_count,
     merge_fixed_day_kline_indexes,
 )
-from .xt_details import enrich_stock_metas_with_xt_details, fetch_xt_detail_map
+from .xt_details import enrich_stock_metas_with_xt_details
 from .xtquant_source import fetch_xt_market_data, iter_xt_sync_batches, xt_market_data_to_docs
 
 
-def resolve_latest_trade_date() -> datetime:
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    start_date = today - timedelta(days=40)
-    trading_days = fetch_trade_calendar(start_date, today)
-    if not trading_days:
-        raise ValueError("failed to resolve latest trade date")
-    return trading_days[-1]
+def set_daily_unit_counts(
+    summary_builder: DailySyncSummaryBuilder,
+    *,
+    expected_codes: set[str],
+    unresolved_codes: set[str],
+) -> None:
+    basic_result = summary_builder.basic_result
+    planned_codes = set(expected_codes) | set(basic_result.detail_requested_codes)
+    failed_codes = (
+        set(basic_result.detail_failed_codes)
+        | set(unresolved_codes)
+    )
+    skipped_codes = (
+        set(basic_result.db_only_detail_missing_codes)
+        | set(basic_result.missing_ipo_codes)
+    ) - failed_codes
+    succeeded_codes = planned_codes - failed_codes - skipped_codes
+    summary_builder.unit_planned_count = len(planned_codes)
+    summary_builder.unit_attempted_count = len(planned_codes)
+    summary_builder.unit_succeeded_count = len(succeeded_codes)
+    summary_builder.unit_skipped_count = len(skipped_codes)
+    summary_builder.unit_failed_count = len(failed_codes & planned_codes)
 
 
 def run_daily_sync(
@@ -64,38 +81,70 @@ def run_daily_sync(
     xt_batch_size: int = 300,
     max_fallback_missing_stocks: int = DEFAULT_MAX_FALLBACK_MISSING_STOCKS,
     max_fallback_missing_days: int = DEFAULT_MAX_FALLBACK_MISSING_DAYS,
+    max_attempts: int = 3,
+    dry_run: bool = False,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     xtdata_client = xtdata_client or default_xtdata
     if xtdata_client is None:
         raise RuntimeError("xtquant is not available in current Python environment")
 
     cfg = cfg or DuckDBConfig()
-    batch_size = max(1, min(int(batch_size), MAX_MONGO_BATCH_SIZE))
+    batch_size = max(1, min(int(batch_size), MAX_DAILY_SYNC_BATCH_SIZE))
     xt_batch_size = max(1, int(xt_batch_size))
-    now = datetime.now()
+    now = now or datetime.now()
+    candidate_end_date = latest_available_day_kline_date(now)
 
-    log_event("info", "xtquant daily kline sync start")
-    # 1. 股票池只做增量比较：已有 DuckDB basic_info 是主数据源，新股才调用 detail。
+    log_event(
+        "info",
+        "xtquant daily kline sync start",
+        beijing_now=now,
+        market_close_time="15:45:00",
+        before_market_close=candidate_end_date.date() < now.date(),
+        candidate_end_date=candidate_end_date.strftime("%Y-%m-%d"),
+    )
+    # 1. 全部沪深股票与 db_only 股票合并为一次 detail 批量请求，后续阶段复用结果。
     basic_result = sync_incremental_basic_info(
         cfg,
         xtdata_client,
         now=now,
-        batch_size=batch_size,
+        dry_run=dry_run,
+        initialize_adjust_factor_baselines=True,
     )
     log_event(
         "info",
         "basic info incremental sync finished",
         inserted=len(basic_result.inserted_docs),
         detail_failed=len(basic_result.detail_failed_codes),
+        missing_ipo=len(basic_result.missing_ipo_codes),
         stock_pool_diff=len(basic_result.stock_pool_diff_rows),
+        adjust_factor_baseline_planned=basic_result.adjust_factor_baseline_planned_count,
+        adjust_factor_baseline_existing=basic_result.adjust_factor_baseline_existing_count,
+        adjust_factor_baseline_written=basic_result.adjust_factor_baseline_written_count,
+        db_only_confirmed_delisted=len(basic_result.db_only_confirmed_delisted_codes),
+        db_only_active_detail=len(basic_result.db_only_active_detail_codes),
+        db_only_detail_missing=len(basic_result.db_only_detail_missing_codes),
+        instrument_detail_requested=basic_result.instrument_detail_requested_count,
+        instrument_detail_returned=len(basic_result.details_by_xt_code),
         **basic_result.db_operation_summary,
     )
+    if basic_result.db_only_active_detail_codes or basic_result.db_only_detail_missing_codes:
+        log_event(
+            "warning",
+            "xtquant_stock_pool_difference_preserved",
+            active_detail_codes=list(basic_result.db_only_active_detail_codes),
+            detail_missing_codes=list(basic_result.db_only_detail_missing_codes),
+        )
 
-    all_basic_docs = load_basic_docs(cfg, hs_only=False)
+    all_basic_docs = project_basic_docs(
+        load_basic_docs(cfg, hs_only=False),
+        basic_result,
+    )
     update_metas, universe_stats = build_day_kline_update_universe(
         all_basic_docs,
         basic_result.stock_pool_diff_rows,
         now,
+        excluded_db_only_codes=basic_result.db_only_detail_missing_codes,
     )
     update_metas, fixed_index_count = merge_fixed_day_kline_indexes(update_metas)
     bj_skipped_stock_count = sum(
@@ -115,24 +164,63 @@ def run_daily_sync(
         fixed_index_count=fixed_index_count,
     )
 
+    latest_state_map = load_latest_state_map(cfg, codes, candidate_end_date)
+    provisional_start_map = build_code_start_map(update_metas, latest_state_map, candidate_end_date)
+    calendar_start_date = candidate_end_date - timedelta(days=40)
+    if provisional_start_map:
+        calendar_start_date = min(calendar_start_date, min(provisional_start_map.values()))
+
     login_with_retry()
     try:
-        # 2. 交易日历仍由 Baostock 提供，用来判断 xtquant 结果是否真的缺日期。
-        end_date = resolve_latest_trade_date()
-        latest_state_map = load_latest_state_map(cfg, codes, end_date)
+        # 2. 单次获取完整任务区间的交易日历，同时确定最终截止交易日和缺口日期。
+        log_event(
+            "info",
+            "daily kline trade calendar query",
+            start_date=calendar_start_date.strftime("%Y-%m-%d"),
+            end_date=candidate_end_date.strftime("%Y-%m-%d"),
+        )
+        trade_dates = fetch_trade_calendar(calendar_start_date, candidate_end_date)
+        if not trade_dates:
+            raise ValueError("failed to resolve latest trade date")
+        end_date = trade_dates[-1]
+        log_event(
+            "info",
+            "daily kline trade calendar resolved",
+            trade_days=len(trade_dates),
+            final_trade_date=end_date.strftime("%Y-%m-%d"),
+        )
+        (
+            previous_trade_date,
+            previous_trade_date_stock_count,
+        ) = load_previous_trade_date_stock_count(
+            cfg,
+            end_date,
+        )
+        summary_builder.previous_trade_date = (
+            previous_trade_date.strftime("%Y-%m-%d")
+            if previous_trade_date is not None
+            else None
+        )
+        summary_builder.previous_trade_date_stock_count = previous_trade_date_stock_count
+        summary_builder.updated_stock_count_diff_vs_previous_trade_date = (
+            -previous_trade_date_stock_count
+        )
         code_start_map = build_code_start_map(update_metas, latest_state_map, end_date)
         summary_builder.active_stock_count = len(code_start_map)
         missing_by_code: dict[str, list[datetime]] = {}
         if not code_start_map:
             log_event("info", "no stocks need daily kline update", end_date=end_date.strftime("%Y-%m-%d"))
+            set_daily_unit_counts(
+                summary_builder,
+                expected_codes=set(),
+                unresolved_codes=set(),
+            )
             summary = summary_builder.to_dict()
+            summary["write_batches"] = 0
             if should_write_report(basic_result, missing_by_code, [], []):
                 write_daily_sync_report(basic_result, summary, now=now, historical_missing_rows=[])
             return summary
 
-        trade_dates = fetch_trade_calendar(min(code_start_map.values()), end_date)
-        if not trade_dates:
-            raise RuntimeError("no trade dates resolved for xtquant daily kline update")
         expected_dates_by_code = build_expected_dates_by_code(update_metas, code_start_map, trade_dates, end_date)
         trade_day_positions = {trade_date: index for index, trade_date in enumerate(trade_dates)}
         active_codes = set(code_start_map)
@@ -141,7 +229,19 @@ def run_daily_sync(
             for meta in update_metas
             if meta.code in active_codes and meta.code not in FIXED_DAY_KLINE_INDEX_CODES
         ]
-        current_details_by_xt_code = fetch_xt_detail_map(xtdata_client, active_xt_codes)
+        current_details_by_xt_code = {
+            code: detail
+            for code, detail in basic_result.details_by_xt_code.items()
+            if code in active_xt_codes
+        }
+        missing_detail_codes = sorted(set(active_xt_codes) - set(current_details_by_xt_code))
+        if missing_detail_codes:
+            log_event(
+                "warning",
+                "daily kline instrument details missing from bulk response",
+                missing_count=len(missing_detail_codes),
+                missing_codes=missing_detail_codes,
+            )
         update_metas, float_volume_stats = enrich_stock_metas_with_xt_details(
             update_metas,
             current_details_by_xt_code,
@@ -153,6 +253,8 @@ def run_daily_sync(
             expected_dates_by_code,
             end_date,
             current_details_by_xt_code=current_details_by_xt_code,
+            latest_state_by_code=latest_state_map,
+            max_attempts=max_attempts,
         )
         log_event(
             "info",
@@ -168,26 +270,44 @@ def run_daily_sync(
         updated_by_date: dict[str, int] = {}
         xtquant_docs_count = 0
         all_invalid_dates: dict[str, list[datetime]] = {}
-        pending_start: datetime | None = None
         pending_docs: list[dict[str, Any]] = []
+        write_batches = 0
 
-        def flush_pending_docs() -> None:
-            nonlocal xtquant_docs_count, pending_docs
-            if not pending_docs:
+        def write_docs(docs: list[dict[str, Any]]) -> None:
+            nonlocal xtquant_docs_count, write_batches
+            if not docs:
                 return
-            write_day_kline_docs(cfg, DAY_COLLECTION, pending_docs)
-            xtquant_docs_count += add_written_doc_stats(pending_docs, written_dates_by_code, updated_by_date)
-            pending_docs = []
+            if not dry_run:
+                write_day_kline_docs(cfg, DAY_COLLECTION, docs)
+                write_batches += 1
+            xtquant_docs_count += add_written_doc_stats(
+                docs,
+                written_dates_by_code,
+                updated_by_date,
+            )
+
+        def buffer_docs(docs: list[dict[str, Any]]) -> None:
+            nonlocal xtquant_docs_count, pending_docs, write_batches
+            if not docs:
+                return
+            offset = 0
+            if pending_docs:
+                needed = batch_size - len(pending_docs)
+                pending_docs.extend(docs[:needed])
+                offset = min(needed, len(docs))
+                if len(pending_docs) == batch_size:
+                    write_docs(pending_docs)
+                    pending_docs = []
+            full_end = offset + ((len(docs) - offset) // batch_size) * batch_size
+            for start in range(offset, full_end, batch_size):
+                write_docs(docs[start : start + batch_size])
+            if full_end < len(docs):
+                pending_docs = docs[full_end:]
 
         for batch_start, batch_metas in iter_xt_sync_batches(update_metas, code_start_map, xt_batch_size=xt_batch_size):
             # 3. 先按增量起点分组，再分批拉 xtquant，避免一只长缺口股票带着整批回拉历史。
             if not batch_metas:
                 continue
-            if pending_start is None:
-                pending_start = batch_start
-            elif batch_start != pending_start:
-                flush_pending_docs()
-                pending_start = batch_start
             market_data = fetch_xt_market_data(
                 xtdata_client,
                 [meta.xt_code for meta in batch_metas],
@@ -206,7 +326,7 @@ def run_daily_sync(
                 invalid_dates,
             )
             if docs:
-                pending_docs.extend(docs)
+                buffer_docs(docs)
             for code, dates in invalid_dates.items():
                 all_invalid_dates.setdefault(code, []).extend(dates)
             log_event(
@@ -217,23 +337,27 @@ def run_daily_sync(
                 docs=len(docs),
                 invalid_days=sum(len(values) for values in invalid_dates.values()),
             )
-        flush_pending_docs()
+        write_docs(pending_docs)
+        pending_docs = []
 
-        missing_by_code = build_missing_by_code(
+        raw_missing_by_code = build_missing_by_code(
             expected_dates_by_code,
             written_dates_by_code,
             all_invalid_dates,
         )
-        missing_days = sum(len(set(values)) for values in missing_by_code.values())
-        if missing_days:
+        raw_missing_days = sum(
+            len(set(values))
+            for values in raw_missing_by_code.values()
+        )
+        if raw_missing_days:
             log_event(
                 "warning",
                 "xtquant_missing_detected",
-                stock_count=len(missing_by_code),
-                missing_days=missing_days,
+                stock_count=len(raw_missing_by_code),
+                missing_days=raw_missing_days,
             )
         recent_missing_by_code, historical_missing_by_code = split_missing_by_fallback_window(
-            missing_by_code,
+            raw_missing_by_code,
             trade_dates,
             fallback_window_trade_days=FALLBACK_WINDOW_TRADE_DAYS,
         )
@@ -254,21 +378,52 @@ def run_daily_sync(
             batch_size=batch_size,
             max_missing_stocks=max_fallback_missing_stocks,
             max_missing_days=max_fallback_missing_days,
+            dry_run=dry_run,
         )
         updated_by_date = add_fallback_counts_by_date(updated_by_date, fallback_summary)
-        missing_today_codes = missing_codes_on_latest_trade_date(missing_by_code, fallback_summary, end_date)
+        missing_by_code = unresolved_after_fallback(
+            raw_missing_by_code,
+            fallback_summary,
+        )
+        missing_today_codes = sorted(
+            code
+            for code, dates in missing_by_code.items()
+            if end_date in set(dates)
+        )
         day_kline_updated_count = xtquant_docs_count + int(fallback_summary.get("fallback_docs", 0)) + int(
             fallback_summary.get("normal_suspend_days", 0)
+        )
+        updated_latest_codes = {
+            code
+            for code, dates in written_dates_by_code.items()
+            if end_date in dates and is_hs_a_share_code(code)
+        }
+        latest_text = end_date.strftime("%Y-%m-%d")
+        updated_latest_codes.update(
+            code
+            for code, dates in fallback_summary.get("resolved_dates_by_code", {}).items()
+            if latest_text in set(dates) and is_hs_a_share_code(code)
         )
 
         summary_builder.day_kline_updated_count = day_kline_updated_count
         summary_builder.xtquant_docs_count = xtquant_docs_count
         summary_builder.day_kline_updated_by_date = updated_by_date
         summary_builder.day_kline_missing_codes_today = missing_today_codes
+        summary_builder.day_kline_updated_stock_count = len(updated_latest_codes)
+        summary_builder.updated_stock_count_diff_vs_previous_trade_date = (
+            len(updated_latest_codes) - previous_trade_date_stock_count
+        )
+        summary_builder.raw_missing_days = raw_missing_days
         summary_builder.missing_by_code = missing_by_code
         summary_builder.fallback_summary = fallback_summary
         summary_builder.historical_missing_rows = historical_missing_rows
+        set_daily_unit_counts(
+            summary_builder,
+            expected_codes=set(expected_dates_by_code),
+            unresolved_codes=set(missing_by_code),
+        )
         result = summary_builder.to_dict()
+        result["write_batches"] = write_batches + int(fallback_summary.get("write_batches", 0))
         if should_write_report(basic_result, missing_by_code, missing_today_codes, historical_missing_rows):
             write_daily_sync_report(
                 basic_result,
@@ -280,6 +435,8 @@ def run_daily_sync(
             "info",
             "xtquant daily kline sync finished",
             basic_inserted_count=result["basic_inserted_count"],
+            basic_missing_ipo_count=len(result["basic_missing_ipo_codes"]),
+            adjust_factor_baseline_written_count=result["adjust_factor_baseline_written_count"],
             stock_pool_xt_only_count=result["stock_pool_xt_only_count"],
             stock_pool_db_only_count=result["stock_pool_db_only_count"],
             day_kline_update_universe_count=result["day_kline_update_universe_count"],

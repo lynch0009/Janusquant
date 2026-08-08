@@ -8,7 +8,7 @@ from typing import Any
 import pandas as pd
 
 from backtest.db import DuckDBConfig
-from backtest.db.duckdb_write import upsert_frame
+from backtest.fetch_data.core.writer import upsert_records
 from backtest.db.precision import normalize_amount, normalize_price, normalize_price_series, normalize_volume
 
 
@@ -84,13 +84,4 @@ def build_baostock_day_doc(row: pd.Series, trade_date: datetime) -> dict[str, An
 
 
 def write_day_kline_docs(db: DuckDBConfig, table: str, docs: list[dict[str, Any]] | pd.DataFrame) -> int:
-    summary = upsert_frame(db, table, docs, key_columns=("code", "date"))
-    return int(summary.rows_written)
-
-
-def build_day_kline_update(doc: dict[str, Any]) -> dict[str, Any]:
-    return doc
-
-
-def build_day_kline_updates(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return list(docs)
+    return upsert_records(db, table, docs, key_columns=("code", "date"), dry_run=False)

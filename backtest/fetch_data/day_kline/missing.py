@@ -6,7 +6,7 @@ from typing import Any, Iterable, Sequence
 from backtest.utils import date_text, to_trade_datetime
 
 from .constants import FALLBACK_WINDOW_TRADE_DAYS
-from .models import DateRange, StockMeta
+from .models import DateRange
 
 
 def merge_dates_to_ranges(dates: Iterable[datetime], trade_day_positions: dict[datetime, int]) -> list[DateRange]:
@@ -119,6 +119,25 @@ def build_historical_missing_rows(historical_missing_by_code: dict[str, list[dat
                 }
             )
     return rows
+
+
+def unresolved_after_fallback(
+    raw_missing_by_code: dict[str, list[datetime]],
+    fallback_summary: dict[str, Any],
+) -> dict[str, list[datetime]]:
+    """Subtract every Baostock-observed day, including confirmed suspensions."""
+
+    resolved_by_code = fallback_summary.get("resolved_dates_by_code", {})
+    unresolved: dict[str, list[datetime]] = {}
+    for code, dates in sorted(raw_missing_by_code.items()):
+        resolved_dates = {
+            to_trade_datetime(value)
+            for value in resolved_by_code.get(code, [])
+        }
+        remaining = sorted(set(dates) - resolved_dates)
+        if remaining:
+            unresolved[code] = remaining
+    return unresolved
 
 
 def missing_codes_on_latest_trade_date(
